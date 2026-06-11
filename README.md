@@ -48,10 +48,10 @@ On the web (`/app → Workflows`) you stack workflows like blocks into one order
 
 - `schedule` installs **one** launchd job (`com.pais.routine`) at the routine's
   time — not a job per agent.
-- When it fires, `routine` runs your stacked workflows **in order, sequentially**
-  — the local twin of `morning_stack.sh`. Each is guarded, so one failure never
-  stops the chain, and you get a one-line Telegram summary if a bot is wired.
-- Reorder/add/remove on the web, then re-run `schedule` to apply.
+- When it fires, `routine` runs your team **in order, sequentially** — the local
+  twin of `morning_stack.sh`. Each is guarded, so one failure never stops the
+  chain, and every teammate **posts its update to your website feed** (no Telegram).
+- Toggle agents active / reorder on the web, then re-run `schedule` to apply.
 
 ## How it maps to the existing PAIS
 
@@ -62,7 +62,6 @@ Runners in `agents.py` map each web agent to its real PAIS capability:
 | briefing  | posts daily brief to your website    | ✅ wired (real)   |
 | career    | `job_scout.py` + `fill_scouted.py`   | scaffold stub     |
 | outreach  | `piontrix_outreach.py`               | scaffold stub     |
-| content   | `content_cron.py`                    | scaffold stub     |
 | assistant | orchestrator general agent           | scaffold stub     |
 
 `briefing` is fully wired (posts to your website feed) to prove the
