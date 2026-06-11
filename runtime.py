@@ -22,7 +22,9 @@ Credentials/state live in ~/.pais/ (0600). Secrets are fetched per-run over TLS
 and never written to disk in clear.
 """
 
+import os
 import plistlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -152,13 +154,17 @@ def cmd_schedule():
         return
     _remove_jobs(LABEL_PREFIX)            # clear any legacy per-agent jobs
     LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
+    # PATH must reach `claude` (subscription CLI) + python so launchd runs find them.
+    dirs = [os.path.dirname(shutil.which("claude") or ""), os.path.dirname(PY),
+            "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    path = ":".join(d for d in dict.fromkeys(dirs) if d)
     plist = {
         "Label": ROUTINE_LABEL,
         "ProgramArguments": [PY, str(RUNTIME), "routine"],
         "StartCalendarInterval": intervals if len(intervals) > 1 else intervals[0],
         "StandardOutPath": str(Path.home() / ".pais" / "routine.out.log"),
         "StandardErrorPath": str(Path.home() / ".pais" / "routine.err.log"),
-        "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/local/bin"},
+        "EnvironmentVariables": {"PATH": path},
     }
     path = LAUNCH_DIR / f"{ROUTINE_LABEL}.plist"
     with open(path, "wb") as f:

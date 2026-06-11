@@ -16,6 +16,9 @@ cd ~/pais-runtime
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 ```
 
+**Requires** the `claude` CLI (your Claude subscription) on PATH — the real
+runners use it to do the work, billed to your flat subscription (no API credits).
+
 ## Connect it to your account (one-time)
 
 The runtime authenticates as you with a Supabase **refresh token**.
@@ -59,10 +62,15 @@ Runners in `agents.py` map each web agent to its real PAIS capability:
 
 | Agent     | Maps to                              | Status            |
 |-----------|--------------------------------------|-------------------|
-| briefing  | posts daily brief to your website    | ✅ wired (real)   |
-| career    | `job_scout.py` + `fill_scouted.py`   | scaffold stub     |
+| career    | web-searches live job postings, ranks, posts matches | ✅ **real** |
+| briefing  | posts daily brief to your website    | ✅ wired (stub)   |
 | outreach  | `piontrix_outreach.py`               | scaffold stub     |
 | assistant | orchestrator general agent           | scaffold stub     |
+
+`career` does genuine work: it runs `claude` with **WebSearch + WebFetch** on your
+machine to find recently-posted jobs matching your `target_roles` + `locations`
+(set in the agent's settings), verifies the URLs, ranks by fit, and posts the
+matches to your website feed.
 
 `briefing` is fully wired (posts to your website feed) to prove the
 secrets → action loop. The stubs validate their required connections and report
