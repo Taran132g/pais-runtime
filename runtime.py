@@ -127,9 +127,11 @@ def cmd_routine():
     if not order:
         print("Routine is empty — nothing to run.")
         return
-    print(f"▶ Morning routine: {' → '.join(order)}")
+    # Reviewer runs LAST (on the backend) so it can grade the others' fresh output.
+    run_order = [a for a in order if a != "reviewer"]
+    print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
     ok = 0
-    for aid in order:
+    for aid in run_order:
         fields = (agents_cfg.get(aid, {}) or {}).get("fields", {})
         try:
             text = runners.run_agent(aid, sec, fields)
@@ -137,7 +139,12 @@ def cmd_routine():
             ok += 1; print(f"  ✓ {aid}: posted")
         except Exception as e:
             print(f"  ✗ {aid}: {e}", file=sys.stderr)
-    print(f"Routine done — {ok}/{len(order)} posted to your website.")
+    try:
+        c.run_backend_agent("reviewer")            # audits the run via the backend
+        print("  ✓ reviewer: audited the run")
+    except Exception as e:
+        print(f"  ✗ reviewer: {e}", file=sys.stderr)
+    print(f"Routine done — {ok}/{len(run_order)} posted, then audited.")
 
 
 def cmd_schedule():
