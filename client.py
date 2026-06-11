@@ -92,5 +92,14 @@ class PaisClient:
         """Decrypted connections — for local execution only. Never persisted in clear."""
         return self._get("/api/agents/secrets")
 
+    def post_message(self, agent: str, text: str) -> None:
+        """Post an agent's update to the user's website feed (replaces Telegram)."""
+        requests.post(
+            f"{API_BASE}/api/agents/message",
+            headers={"Authorization": "Bearer " + self._access_token(),
+                     "Content-Type": "application/json"},
+            json={"agent": agent, "text": text}, timeout=20,
+        ).raise_for_status()
+
     def whoami(self) -> dict:
         return self._get("/api/auth/me")

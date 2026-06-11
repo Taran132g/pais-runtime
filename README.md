@@ -36,7 +36,7 @@ The runtime authenticates as you with a Supabase **refresh token**.
 ```bash
 ./venv/bin/python runtime.py status            # show your routine (order) + connections
 ./venv/bin/python runtime.py routine           # run the whole routine now, in order
-./venv/bin/python runtime.py run briefing      # run one workflow now (briefing pings your Telegram)
+./venv/bin/python runtime.py run briefing      # run one workflow now (briefing posts to your website feed)
 ./venv/bin/python runtime.py schedule          # install the single morning-routine launchd job
 ./venv/bin/python runtime.py unschedule        # remove it
 ```
@@ -59,13 +59,13 @@ Runners in `agents.py` map each web agent to its real PAIS capability:
 
 | Agent     | Maps to                              | Status            |
 |-----------|--------------------------------------|-------------------|
-| briefing  | Telegram daily brief                 | ✅ wired (real)   |
+| briefing  | posts daily brief to your website    | ✅ wired (real)   |
 | career    | `job_scout.py` + `fill_scouted.py`   | scaffold stub     |
 | outreach  | `piontrix_outreach.py`               | scaffold stub     |
 | content   | `content_cron.py`                    | scaffold stub     |
 | assistant | orchestrator general agent           | scaffold stub     |
 
-`briefing` is fully wired (sends a real message via your own bot) to prove the
+`briefing` is fully wired (posts to your website feed) to prove the
 secrets → action loop. The stubs validate their required connections and report
 the capability they map to — port each from `~/agentic_os` as the runtime matures.
 

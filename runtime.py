@@ -100,12 +100,14 @@ def _remove_jobs(prefix: str) -> int:
 
 
 def cmd_run(agent: str):
-    """Run a single workflow now (manual / webhook-style)."""
+    """Run a single teammate now and post its update to the website feed."""
     import agents as runners
     c = PaisClient()
     sec = c.secrets().get("connections", {})
     fields = (c.config().get("agents", {}).get(agent, {}) or {}).get("fields", {})
-    print(f"✓ {runners.run_agent(agent, sec, fields)}")
+    text = runners.run_agent(agent, sec, fields)
+    c.post_message(agent, text)
+    print(f"✓ {agent}: posted to your website feed")
 
 
 def cmd_routine():
@@ -124,23 +126,16 @@ def cmd_routine():
         print("Routine is empty — nothing to run.")
         return
     print(f"▶ Morning routine: {' → '.join(order)}")
-    results = []
+    ok = 0
     for aid in order:
         fields = (agents_cfg.get(aid, {}) or {}).get("fields", {})
         try:
-            res = runners.run_agent(aid, sec, fields)
-            results.append((aid, True)); print(f"  ✓ {aid}: {res}")
+            text = runners.run_agent(aid, sec, fields)
+            c.post_message(aid, text)              # → website feed (no Telegram)
+            ok += 1; print(f"  ✓ {aid}: posted")
         except Exception as e:
-            results.append((aid, False)); print(f"  ✗ {aid}: {e}", file=sys.stderr)
-    ok = sum(1 for _, s in results if s)
-    print(f"Routine done — {ok}/{len(results)} ran.")
-    # Telegram a one-line summary if the user wired a bot.
-    try:
-        if sec.get("telegram_bot_token") and sec.get("telegram_chat_id"):
-            lines = [f"{'✅' if s else '⚠️'} {a}" for a, s in results]
-            runners._telegram(sec, "☀️ <b>PAIS morning routine</b>\n" + "\n".join(lines))
-    except Exception:
-        pass
+            print(f"  ✗ {aid}: {e}", file=sys.stderr)
+    print(f"Routine done — {ok}/{len(order)} posted to your website.")
 
 
 def cmd_schedule():
