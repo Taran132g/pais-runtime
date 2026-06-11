@@ -1,4 +1,4 @@
-# PAIS Desktop Runtime (scaffold)
+# PAIS Desktop Runtime
 
 The local half of PAIS. You set agents up on the web (**/app → an agent → Set up**):
 required info, personal secrets (Telegram, API keys), and a schedule or webhook.
@@ -56,25 +56,25 @@ On the web (`/app → Workflows`) you stack workflows like blocks into one order
   chain, and every teammate **posts its update to your website feed** (no Telegram).
 - Toggle agents active / reorder on the web, then re-run `schedule` to apply.
 
-## How it maps to the existing PAIS
+## The runners — all real
 
-Runners in `agents.py` map each web agent to its real PAIS capability:
+Every runner in `agents.py` does genuine work on your machine, steered by the
+persona + fields you set in the web app (each prompt embeds your settings):
 
-| Agent     | Maps to                              | Status            |
-|-----------|--------------------------------------|-------------------|
-| career    | web-searches live job postings, ranks, posts matches | ✅ **real** |
-| briefing  | posts daily brief to your website    | ✅ wired (stub)   |
-| outreach  | `piontrix_outreach.py`               | scaffold stub     |
-| assistant | orchestrator general agent           | scaffold stub     |
+| Agent     | What it really does                                                | Status |
+|-----------|--------------------------------------------------------------------|--------|
+| career    | `claude` + WebSearch/WebFetch finds live postings for your `target_roles`/`locations`, verifies URLs, ranks, posts — and queues them for `apply` | ✅ real |
+| apply     | opens every queued application page in your browser — **you** review, attach your résumé, and submit | ✅ real · needs you |
+| briefing  | daily brief grounded in what your team actually posted in the last day | ✅ real |
+| email     | **read-only** Gmail IMAP triage of the last day, classified around your `priorities` | ✅ real |
+| outreach  | finds 2 live prospects for your `company`, drafts full emails for review (Hunter contact lookup if key set) — **never sends** | ✅ real |
+| linkedin  | drafts 1 connection note + follow-up per run toward your `goal` — you send by hand (no LinkedIn automation) | ✅ real |
+| code      | commits + pushes your listed `repos` behind a secret guard (refuses diffs that look like keys/tokens) | ✅ real |
+| reviewer  | runs **server-side** after the routine and grades each agent's actual output | ✅ real |
+| assistant | the Control Room — chat lives on the web                            | web |
 
-`career` does genuine work: it runs `claude` with **WebSearch + WebFetch** on your
-machine to find recently-posted jobs matching your `target_roles` + `locations`
-(set in the agent's settings), verifies the URLs, ranks by fit, and posts the
-matches to your website feed.
-
-`briefing` is fully wired (posts to your website feed) to prove the
-secrets → action loop. The stubs validate their required connections and report
-the capability they map to — port each from `~/agentic_os` as the runtime matures.
+Safety defaults: email never modifies your mailbox, outreach and linkedin never
+send anything, apply never submits, and code refuses pushes containing secrets.
 
 ## Security
 

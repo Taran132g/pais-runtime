@@ -92,6 +92,10 @@ class PaisClient:
         """Decrypted connections — for local execution only. Never persisted in clear."""
         return self._get("/api/agents/secrets")
 
+    def messages(self, agent: str | None = None) -> dict:
+        """The team's feed messages (newest last) — used by the briefing runner."""
+        return self._get("/api/agents/messages" + (f"?agent={agent}" if agent else ""))
+
     def run_backend_agent(self, agent: str) -> None:
         """Trigger a backend-run agent (e.g. the reviewer audit, which reads the
         web feed). Used at the end of the routine."""

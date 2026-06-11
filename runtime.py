@@ -106,8 +106,9 @@ def cmd_run(agent: str):
     import agents as runners
     c = PaisClient()
     sec = c.secrets().get("connections", {})
-    fields = (c.config().get("agents", {}).get(agent, {}) or {}).get("fields", {})
-    text = runners.run_agent(agent, sec, fields)
+    acfg = c.config().get("agents", {}).get(agent, {}) or {}
+    text = runners.run_agent(agent, sec, acfg.get("fields", {}),
+                             persona=acfg.get("persona", ""), client=c)
     c.post_message(agent, text)
     print(f"✓ {agent}: posted to your website feed")
 
@@ -132,9 +133,10 @@ def cmd_routine():
     print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
     ok = 0
     for aid in run_order:
-        fields = (agents_cfg.get(aid, {}) or {}).get("fields", {})
+        acfg = agents_cfg.get(aid, {}) or {}
         try:
-            text = runners.run_agent(aid, sec, fields)
+            text = runners.run_agent(aid, sec, acfg.get("fields", {}),
+                                     persona=acfg.get("persona", ""), client=c)
             c.post_message(aid, text)              # → website feed (no Telegram)
             ok += 1; print(f"  ✓ {aid}: posted")
         except Exception as e:
