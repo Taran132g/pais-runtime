@@ -83,12 +83,15 @@ def _stub(label: str, maps_to: str, needs: list) -> Callable:
     return runner
 
 
-# agent id → runner
+# agent id → runner (mirrors the n8n / morning_stack workflows)
 RUNNERS = {
-    "career":    run_career,           # ← real work
+    "career":    run_career,           # ← real work (live job scout)
     "briefing":  run_briefing,
     "assistant": _stub("Chief of Staff", "orchestrator general agent", []),
-    "outreach":  _stub("Outreach", "piontrix_outreach.py", ["gmail_address", "gmail_app_password", "hunter_api_key"]),
+    "email":     _stub("Email", "email_triage.py", ["gmail_address", "gmail_app_password"]),
+    "outreach":  _stub("Outreach", "piontrix_outreach.py + brainscan_outreach.py", ["gmail_address", "gmail_app_password", "hunter_api_key"]),
+    "linkedin":  _stub("LinkedIn", "linkedin_internship.py", []),
+    "code":      _stub("Code", "tools/repo_sync.py", []),
 }
 
 
