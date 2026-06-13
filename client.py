@@ -1,9 +1,16 @@
 """
 PAIS runtime — API client.
 
-Talks to the PAIS backend as the signed-in user. Auth uses a Supabase REFRESH
-token (long-lived) stored locally; we exchange it for short-lived access tokens
-as needed, and persist the rotated refresh token Supabase hands back.
+Talks to the PAIS backend as the signed-in user. Two auth paths:
+
+  1. device_token (PREFERRED) — a durable, non-rotating runtime token minted by
+     the backend at `pais link` time and exchanged for short-lived access tokens.
+     Immune to web-app session rotation / browser sign-out.
+  2. refresh_token (LEGACY) — a borrowed Supabase refresh token. Works, but the
+     web app rotates it and a browser "Sign out" revokes it (the 06-12 zero-run
+     failure). Kept as a fallback until the device-link backend ships.
+
+`_access_token()` uses the device token if present, else the refresh token.
 
 Credentials + cached state live under ~/.pais/ with 0600 perms. Nothing here is
 ever logged.
@@ -46,22 +53,53 @@ class PaisClient:
     # ── auth ──────────────────────────────────────────────────────────────
     @staticmethod
     def login(refresh_token: str) -> None:
-        """Store a Supabase refresh token (one-time, from the web app)."""
+        """Store a Supabase refresh token (legacy path, one-time, from the web app)."""
         _write_private(CRED_FILE, {"refresh_token": refresh_token.strip()})
+
+    @staticmethod
+    def save_device_token(token: str) -> None:
+        """Store a durable device token from `pais link` (preferred path). Kept
+        alongside any existing creds so a linked machine drops the legacy token."""
+        creds = json.loads(CRED_FILE.read_text()) if CRED_FILE.exists() else {}
+        creds["device_token"] = token.strip()
+        creds.pop("refresh_token", None)        # device token supersedes the borrowed one
+        _write_private(CRED_FILE, creds)
 
     @property
     def logged_in(self) -> bool:
-        return bool(self._creds.get("refresh_token"))
+        return bool(self._creds.get("device_token") or self._creds.get("refresh_token"))
 
     def _access_token(self) -> str:
-        if not self.logged_in:
-            raise NotLoggedIn("Run `pais login` first.")
         if self._access and time.time() < self._exp - 60:
             return self._access
+        if self._creds.get("device_token"):
+            return self._device_access(self._creds["device_token"])
+        if self._creds.get("refresh_token"):
+            return self._refresh_access(self._creds["refresh_token"])
+        raise NotLoggedIn("Run `pais link <code>` (or legacy `pais login`) first.")
+
+    def _device_access(self, device_token: str) -> str:
+        """Exchange the durable device token for a short-lived access token.
+        Backend endpoint POST /api/runtime/session (SPEC in runtime.py cmd_link).
+        The device token never rotates — only the access token below expires."""
+        r = requests.post(
+            f"{API_BASE}/api/runtime/session",
+            headers={"Authorization": "Bearer " + device_token},
+            timeout=20,
+        )
+        if not r.ok:
+            raise NotLoggedIn(f"Device token rejected ({r.status_code}). Re-run `pais link`.")
+        data = r.json()
+        self._access = data["access_token"]
+        self._exp = time.time() + data.get("expires_in", 3600)
+        return self._access
+
+    def _refresh_access(self, refresh_token: str) -> str:
+        """Legacy: exchange the borrowed Supabase refresh token (which rotates)."""
         r = requests.post(
             f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
             headers={"apikey": SUPABASE_ANON, "Content-Type": "application/json"},
-            json={"refresh_token": self._creds["refresh_token"]},
+            json={"refresh_token": refresh_token},
             timeout=20,
         )
         if not r.ok:
