@@ -19,6 +19,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -115,25 +116,63 @@ def run_career(secrets: dict, fields: dict, persona: str = "") -> str:
 
 # ── apply: open scouted applications — needs the user to finish ───────────────
 def run_apply(secrets: dict, fields: dict, persona: str = "") -> str:
-    """Open every scouted application page in the user's browser. The user
-    reviews, fills what's left, attaches their résumé, and submits — this agent
-    always needs their attention to finish."""
+    """Fill / open every scouted application. On a machine with the local
+    Gemini-in-Chrome fill pipeline installed (the owner's setup) it DRIVES the
+    agentic fill — a window per job with the brief sent to Gemini for you to
+    Start. Everywhere else (customers) it just opens the page for manual fill.
+    Never submits — you always review, attach your résumé, and submit yourself."""
     try:
         jobs = json.loads(SCOUT_CACHE.read_text()) if SCOUT_CACHE.exists() else []
     except Exception:
         jobs = []
+    jobs = [j for j in jobs if str(j.get("url", "")).startswith("http")]
     if not jobs:
         return ("No scouted applications queued yet — run the Career agent first, "
                 "then run me to open its matches on your screen.")
-    opened = []
-    for j in jobs:
-        url = str(j.get("url", ""))
-        if url.startswith("http"):
+    cap = int(os.environ.get("APPLY_FILL_LIMIT", "5"))      # never spawn unbounded windows
+    batch = jobs[:cap]
+
+    # Owner power-fill: agentic Gemini-in-Chrome fill via the OPTIONAL local
+    # pipeline (~/agentic_os/tools/browser_fill.py — same one the old n8n
+    # apply-jobs / fill_scouted.py used). Guarded import: customers without it
+    # fall through to opening the tab. Disable with the agent field gemini_fill=0;
+    # point elsewhere with PAIS_FILL_DIR. Needs a real GUI session + Gemini-in-
+    # Chrome, so a frozen/headless morning will fall back to open-tab.
+    browser_fill = None
+    if str(fields.get("gemini_fill", "1")).lower() not in ("0", "false", "no", "off"):
+        try:
+            fill_dir = os.path.expanduser(os.environ.get("PAIS_FILL_DIR", "~/agentic_os"))
+            if fill_dir not in sys.path:
+                sys.path.insert(0, fill_dir)
+            from tools.browser_fill import browser_fill  # type: ignore
+        except Exception:
+            browser_fill = None
+
+    if browser_fill:
+        engaged, failed = [], []
+        for j in batch:
             try:
-                webbrowser.open(url)
-                opened.append(f"• {j.get('company','?')} — {j.get('role','?')}\n  {url}")
-            except Exception:
-                pass
+                browser_fill(j, notify=False, start_task=False)
+                engaged.append(f"• {j.get('company','?')} — {j.get('role','?')}\n  {j['url']}")
+            except Exception as e:
+                failed.append(f"• {j.get('company','?')}: {str(e)[:80]}")
+        if engaged or failed:
+            body = (f"🤖 Gemini fill engaged for {len(engaged)} job(s) — each opened in its "
+                    f"own window with the brief sent to Gemini. Click “Start task” in "
+                    f"each window, then review, attach your résumé, and submit yourself. "
+                    f"Nothing is submitted without you.\n\n" + "\n".join(engaged))
+            if failed:
+                body += "\n\n⚠️ Couldn't engage (open these manually):\n" + "\n".join(failed)
+            return body
+
+    # Portable fallback (customers / no GUI): just open the pages for manual fill.
+    opened = []
+    for j in batch:
+        try:
+            webbrowser.open(j["url"])
+            opened.append(f"• {j.get('company','?')} — {j.get('role','?')}\n  {j['url']}")
+        except Exception:
+            pass
     if not opened:
         return "The scout queue had no openable URLs — run the Career agent again."
     return (
