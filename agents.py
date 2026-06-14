@@ -340,7 +340,15 @@ def run_briefing(secrets: dict, fields: dict, persona: str = "", client=None) ->
         f"{DESCRIPTIVE}\nLead with the single most important item, then: what happened, "
         f"what's open, what matters next — with the exact next action for each thread."
     )
-    return _claude(prompt, timeout=240)
+    # briefing is the FIRST agent every run, so it absorbs any cold-start latency
+    # (the first `claude -p` after a wake). Give it headroom + one retry instead of
+    # losing the whole brief to a slow first call. NOTE: this does NOT rescue a run
+    # where the Mac is asleep on battery (the timer is wall-clock and keeps ticking
+    # while frozen) — that's an AC/lid problem, not a timeout problem.
+    try:
+        return _claude(prompt, timeout=420)
+    except subprocess.TimeoutExpired:
+        return _claude(prompt, timeout=600)
 
 
 def run_assistant(secrets: dict, fields: dict, persona: str = "") -> str:

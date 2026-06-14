@@ -278,6 +278,19 @@ def cmd_routine():
     print(f"Routine done — {ok}/{len(run_order)} posted, then audited.")
 
 
+def _hold_awake(on: bool) -> None:
+    """Keep the Mac awake across a routine run even on BATTERY. caffeinate's
+    PreventSystemSleep is ignored on battery; `pmset disablesleep` is the
+    kernel-level override that is not. Best-effort via `sudo -n` — silently
+    no-ops until the one-time pmset sudoers rule is installed (see README),
+    then it takes effect. ALWAYS reset to 0 after the run, or the Mac never sleeps."""
+    try:
+        subprocess.run(["sudo", "-n", "pmset", "-a", "disablesleep",
+                        "1" if on else "0"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 def cmd_daemon():
     """Persistent scheduler loop — the always-on half of the runtime.
 
@@ -288,6 +301,7 @@ def cmd_daemon():
     wake — so a routine missed at 7:30 fires the moment the machine is next awake.
     """
     print(f"[daemon] started pid={os.getpid()} — checking every 60s", flush=True)
+    _hold_awake(False)                    # clear any stale disablesleep from a prior crash
     cron = "30 7 * * *"
     cron_checked = 0.0
     while True:
@@ -306,7 +320,11 @@ def cmd_daemon():
             print(f"[daemon] routine due (cron='{cron}') — running", flush=True)
             state["last_attempt_ts"] = time.time()
             _save_state(state)
-            r = subprocess.run([PY, str(RUNTIME), "routine"], timeout=3600)
+            _hold_awake(True)             # lock awake even on battery for the run
+            try:
+                r = subprocess.run([PY, str(RUNTIME), "routine"], timeout=3600)
+            finally:
+                _hold_awake(False)        # always release — else the Mac never sleeps
             if r.returncode == 0:
                 state = _load_state()
                 state["last_success_date"] = now.strftime("%Y-%m-%d")
