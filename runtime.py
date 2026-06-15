@@ -257,8 +257,10 @@ def cmd_routine():
     if not order:
         print("Routine is empty — nothing to run.")
         return
+    # apply is WEBHOOK / single-run ONLY (`runtime.py run apply`) — excluded from
+    # the scheduled routine so it never opens browser windows unattended.
     # Reviewer runs LAST (on the backend) so it can grade the others' fresh output.
-    run_order = [a for a in order if a != "reviewer"]
+    run_order = [a for a in order if a not in ("reviewer", "apply")]
     print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
     ok = 0
     for aid in run_order:
