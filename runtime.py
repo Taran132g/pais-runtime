@@ -271,10 +271,10 @@ def cmd_routine():
     if not order:
         print("Routine is empty — nothing to run.")
         return
-    # apply is WEBHOOK / single-run ONLY (`runtime.py run apply`) — excluded from
-    # the scheduled routine so it never opens browser windows unattended.
+    # apply REJOINED the routine 2026-06-16 (testing the full pipeline end-to-end).
+    # It opens Gemini-fill windows, so it needs the Mac awake with a GUI session.
     # Reviewer runs LAST (on the backend) so it can grade the others' fresh output.
-    run_order = [a for a in order if a not in ("reviewer", "apply")]
+    run_order = [a for a in order if a != "reviewer"]
     print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
     ok = 0
     for aid in run_order:
