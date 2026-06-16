@@ -52,11 +52,12 @@ STATE_FILE = Path.home() / ".pais" / "runtime_state.json"   # daemon run-state (
 ATTEMPT_COOLDOWN_S = 1800             # min gap between routine attempts after a failure
 
 
-def _telegram_alert(text: str) -> None:
-    """Best-effort Telegram ping for unattended failures (e.g. dead session at
-    7:30am). Reads the bot creds from agentic_os/.env; silent if unconfigured."""
-    creds = {}
+def _telegram(text: str) -> None:
+    """Send a plain-text Telegram message (no parse_mode → no HTML-escaping
+    pitfalls). Reads bot creds from agentic_os/.env; silent if unconfigured.
+    Truncates to Telegram's limit. Never raises."""
     try:
+        creds = {}
         for line in AGENTIC_ENV.read_text().splitlines():
             if line.startswith(("TELEGRAM_BOT_TOKEN=", "TELEGRAM_CHAT_ID=")):
                 k, _, v = line.partition("=")
@@ -66,9 +67,21 @@ def _telegram_alert(text: str) -> None:
             return
         import requests
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat, "text": text}, timeout=10)
+                      json={"chat_id": chat, "text": text[:4000]}, timeout=10)
     except Exception:
-        pass  # alerting must never break (or mask) the real failure
+        pass  # messaging must never break (or mask) the real work
+
+
+def _telegram_alert(text: str) -> None:
+    """Failure ping (kept for the unattended-failure call sites)."""
+    _telegram(text)
+
+
+def _tg_agent(agent: str, text: str) -> None:
+    """Each agent messages Telegram with its update (mirrors the web feed).
+    Long reports are truncated with a pointer to the full feed."""
+    body = text if len(text) <= 3800 else text[:3800] + "\n\n…(full report in your web feed)"
+    _telegram(f"🤖 {agent} — {datetime.now().strftime('%b %d')}\n\n{body}")
 
 
 # ── cron → launchd StartCalendarInterval ──────────────────────────────────────
@@ -230,7 +243,8 @@ def cmd_run(agent: str):
     text = runners.run_agent(agent, sec, acfg.get("fields", {}),
                              persona=acfg.get("persona", ""), client=c)
     c.post_message(agent, text)
-    print(f"✓ {agent}: posted to your website feed")
+    _tg_agent(agent, text)                         # → Telegram too
+    print(f"✓ {agent}: posted to your website feed + Telegram")
 
 
 def cmd_routine():
@@ -268,13 +282,21 @@ def cmd_routine():
         try:
             text = runners.run_agent(aid, sec, acfg.get("fields", {}),
                                      persona=acfg.get("persona", ""), client=c)
-            c.post_message(aid, text)              # → website feed (no Telegram)
+            c.post_message(aid, text)              # → website feed
+            _tg_agent(aid, text)                   # → Telegram (each process messages you)
             ok += 1; print(f"  ✓ {aid}: posted")
         except Exception as e:
             print(f"  ✗ {aid}: {e}", file=sys.stderr)
+            _telegram(f"⚠️ {aid} failed in the morning routine: {str(e)[:300]}")
     try:
         c.run_backend_agent("reviewer")            # audits the run via the backend
         print("  ✓ reviewer: audited the run")
+        try:                                       # mirror the reviewer's report to Telegram
+            rev = c.messages(agent="reviewer").get("messages", [])
+            if rev:
+                _tg_agent("reviewer", rev[-1].get("text", ""))
+        except Exception:
+            pass
     except Exception as e:
         print(f"  ✗ reviewer: {e}", file=sys.stderr)
     print(f"Routine done — {ok}/{len(run_order)} posted, then audited.")
