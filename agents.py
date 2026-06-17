@@ -114,13 +114,53 @@ def run_career(secrets: dict, fields: dict, persona: str = "") -> str:
     return "\n".join(lines)
 
 
+def _verify_fill_screenshot(res: dict, company: str, role: str) -> tuple[bool, str]:
+    """Picture-based verification of one Gemini fill. Writes the post-Start-task
+    screenshot browser_fill captured to a temp PNG and asks claude (vision via the
+    Read tool) whether Gemini actually STARTED FILLING the form — fields populated
+    and/or the agent visibly working, not a stalled empty page. Returns
+    (filled, reason). Conservative: any missing picture or uncertain verdict ⇒
+    NOT filled, so the apply gate fails loud rather than claiming a phantom fill."""
+    data = res.get("screenshot_bytes") or b""
+    if not data:
+        return False, "no screenshot captured to verify the fill"
+    import tempfile
+    shot = Path(tempfile.gettempdir()) / f"apply_verify_{os.getpid()}_{abs(hash(company+role))%10000}.png"
+    try:
+        shot.write_bytes(data)
+        prompt = (
+            f"Read the image at {shot} and look at it carefully. It is a Google Chrome "
+            f"window showing the '{company} — {role}' job application, with Google "
+            f"Gemini's agentic side panel open. Decide ONE thing: has Gemini actually "
+            f"STARTED FILLING this application form? 'Filling' means form fields show "
+            f"entered values, and/or the Gemini panel shows it actively working / "
+            f"browsing the page. It is NOT filling if an un-clicked 'Start task' button "
+            f"is still shown, the form is empty, or the page errored / didn't load.\n"
+            f"Reply with EXACTLY one line, no preamble: "
+            f"'FILLED: <reason in <=8 words>' or 'NOT_FILLED: <reason in <=8 words>'."
+        )
+        out = _claude(prompt, tools="Read", timeout=120).strip()
+    except Exception as e:
+        return False, f"vision verification errored: {str(e)[:80]}"
+    finally:
+        try:
+            shot.unlink()
+        except Exception:
+            pass
+    if out.upper().startswith("FILLED"):
+        return True, out[:140]
+    return False, (out[:140] or "vision check could not confirm a fill")
+
+
 # ── apply: open scouted applications — needs the user to finish ───────────────
 def run_apply(secrets: dict, fields: dict, persona: str = "") -> str:
     """Fill / open every scouted application. On a machine with the local
     Gemini-in-Chrome fill pipeline installed (the owner's setup) it DRIVES the
-    agentic fill — a window per job with the brief sent to Gemini for you to
-    Start. Everywhere else (customers) it just opens the page for manual fill.
-    Never submits — you always review, attach your résumé, and submit yourself."""
+    agentic fill — a window per job, brief sent to Gemini, 'Start task' clicked —
+    then VERIFIES each fill by screenshot. If a job can't be verified as filling,
+    it stops there and reports the apply as failed (rather than silently opening
+    windows that never filled). Everywhere else (customers) it just opens the page
+    for manual fill. Never submits — you review, attach your résumé, and submit."""
     try:
         jobs = json.loads(SCOUT_CACHE.read_text()) if SCOUT_CACHE.exists() else []
     except Exception:
@@ -149,21 +189,38 @@ def run_apply(secrets: dict, fields: dict, persona: str = "") -> str:
             browser_fill = None
 
     if browser_fill:
-        engaged, failed = [], []
+        # Fire-and-VERIFY, one job at a time. For each job we actually trigger the
+        # Gemini fill (start_task=True — the prior start_task=False only pasted the
+        # brief and never clicked Start task, so nothing ever filled), then take a
+        # picture and confirm Gemini is filling. The gate needs BOTH signals:
+        #   • browser_fill ok  → the 'Start task' button was consumed (OCR check)
+        #   • vision FILLED    → the screenshot shows the form actually filling
+        # On the FIRST job that fails verification we STOP — no point opening more
+        # windows when the pipeline is broken — and report the apply as failed.
+        verified = []
         for j in batch:
+            company, role, url = j.get("company", "?"), j.get("role", "?"), j.get("url", "")
             try:
-                browser_fill(j, notify=False, start_task=False)
-                engaged.append(f"• {j.get('company','?')} — {j.get('role','?')}\n  {j['url']}")
+                res = browser_fill(j, notify=False, start_task=True, poll=False)
             except Exception as e:
-                failed.append(f"• {j.get('company','?')}: {str(e)[:80]}")
-        if engaged or failed:
-            body = (f"🤖 Gemini fill engaged for {len(engaged)} job(s) — each opened in its "
-                    f"own window with the brief sent to Gemini. Click “Start task” in "
-                    f"each window, then review, attach your résumé, and submit yourself. "
-                    f"Nothing is submitted without you.\n\n" + "\n".join(engaged))
-            if failed:
-                body += "\n\n⚠️ Couldn't engage (open these manually):\n" + "\n".join(failed)
-            return body
+                res = {"ok": False, "error": f"fill crashed: {str(e)[:120]}", "screenshot_bytes": b""}
+            pic_ok, why = _verify_fill_screenshot(res, company, role)
+            if not (res.get("ok") and pic_ok):
+                reason = why if not pic_ok else (res.get("error") or f"status={res.get('status','?')}")
+                done = len(verified)
+                msg = (f"❌ JOB APPLY FAILED — stopped after {done} of {len(batch)} job(s).\n\n"
+                       f"Could not verify Gemini filled:\n• {company} — {role}\n  {url}\n"
+                       f"  reason: {reason}\n\n")
+                if verified:
+                    msg += "Verified filling before the stop:\n" + "\n".join(verified) + "\n\n"
+                msg += ("Open that job's Chrome window and finish it by hand, or re-run the "
+                        "Apply agent. Nothing was submitted.")
+                return msg
+            verified.append(f"• {company} — {role}\n  {url}  ✓ verified filling")
+        return (f"✅ Gemini fill VERIFIED for all {len(verified)} job(s) — each form is "
+                f"actively being filled (confirmed by screenshot). Review the fields, fix "
+                f"any small errors, attach your résumé, and submit yourself. Nothing is "
+                f"submitted without you.\n\n" + "\n".join(verified))
 
     # Portable fallback (customers / no GUI): just open the pages for manual fill.
     opened = []
