@@ -314,13 +314,31 @@ def run_linkedin(secrets: dict, fields: dict, persona: str = "") -> str:
 def run_code(secrets: dict, fields: dict, persona: str = "") -> str:
     """Commit + push each repo path the user listed, refusing any push whose
     diff looks like it contains a secret. Reports exactly what shipped."""
-    repos = [p.strip() for p in (fields.get("repos") or "").replace("\n", ",").split(",") if p.strip()]
-    if not repos:
+    tokens = [p.strip() for p in (fields.get("repos") or "").replace("\n", ",").split(",") if p.strip()]
+    if not tokens:
         return ("List the local repo paths to sync in my settings (comma-separated, "
                 "e.g. ~/projects/myapp) and I'll commit + push them behind a secret guard.")
+    # The "Repos to sync" field must hold actual filesystem paths, not a prose
+    # description. A token with whitespace or brackets (e.g. "agentic_os (primary:
+    # PAIS orchestrator)") is the latter — splitting it on commas shatters it into
+    # junk that used to be reported as "not a git repo". Detect that up front and
+    # tell the user to fix the setting, rather than emitting misleading skips.
+    repos = [t for t in tokens if not any(ch in t for ch in " ()[]:")]
+    malformed = [t for t in tokens if t not in repos]
+    if not repos:
+        return ("My 'Repos to sync' setting looks like a description, not paths — I "
+                "can't sync prose. Set it to comma-separated local repo paths, e.g.\n"
+                "  ~/agentic_os, ~/pais-runtime, ~/FindingFounders\n"
+                "and I'll commit + push each behind the secret guard.")
     report = []
+    if malformed:
+        report.append(f"• ignored {len(malformed)} non-path entr{'y' if len(malformed)==1 else 'ies'} "
+                      f"in the repos setting (looked like prose, not a path)")
     for rp in repos[:6]:
         path = Path(os.path.expanduser(rp))
+        if not path.is_dir():
+            report.append(f"• {rp}: path not found — skipped")
+            continue
         if not (path / ".git").is_dir():
             report.append(f"• {rp}: not a git repo — skipped")
             continue

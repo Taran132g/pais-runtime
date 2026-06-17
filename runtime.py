@@ -84,6 +84,33 @@ def _tg_agent(agent: str, text: str) -> None:
     _telegram(f"🤖 {agent} — {datetime.now().strftime('%b %d')}\n\n{body}")
 
 
+def _telegram_long(text: str) -> None:
+    """Send the FULL text to Telegram, split into <=4000-char messages on line
+    boundaries (Telegram hard-caps one message at 4096). Used where the whole
+    report matters — the reviewer's scheduled digest and individual manual runs."""
+    LIMIT = 3900
+    chunks, cur = [], ""
+    for line in (text or "").split("\n"):
+        while len(line) > LIMIT:                    # a single oversized line
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:LIMIT]); line = line[LIMIT:]
+        if cur and len(cur) + len(line) + 1 > LIMIT:
+            chunks.append(cur); cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    if cur:
+        chunks.append(cur)
+    total = len(chunks) or 1
+    for i, ch in enumerate(chunks, 1):
+        _telegram(ch if total == 1 else f"{ch}\n\n({i}/{total})")
+
+
+def _tg_agent_full(agent: str, text: str) -> None:
+    """Like _tg_agent but sends the COMPLETE output (chunked), never truncated."""
+    _telegram_long(f"🤖 {agent} — {datetime.now().strftime('%b %d')}\n\n{text}")
+
+
 # ── cron → launchd StartCalendarInterval ──────────────────────────────────────
 def cron_to_calendar(expr: str):
     """Convert the supported preset cron shapes to launchd intervals.
@@ -243,15 +270,23 @@ def cmd_run(agent: str):
     text = runners.run_agent(agent, sec, acfg.get("fields", {}),
                              persona=acfg.get("persona", ""), client=c)
     c.post_message(agent, text)
-    _tg_agent(agent, text)                         # → Telegram too
+    _tg_agent_full(agent, text)                    # → Telegram, FULL output (manual run)
     print(f"✓ {agent}: posted to your website feed + Telegram")
 
 
-def cmd_routine():
+def cmd_routine(scheduled: bool = False):
     """
     Run the whole morning routine, in order — the local mirror of morning_stack.sh.
     Each workflow is guarded so one failure never stops the chain; a summary is
     printed (and Telegrammed if a bot is configured).
+
+    Telegram policy:
+      - scheduled run (daemon, PAIS_SCHEDULED=1): ONLY the reviewer messages you,
+        with its complete audit — no per-agent pings, so the morning is one digest.
+      - manual `routine`: each agent still pings (the prior behavior) for visibility
+        while you watch it run by hand.
+    Either way the reviewer's report is sent in FULL (chunked past the 4096 cap),
+    and every agent always posts to the website feed.
     """
     # Hold the Mac awake for the whole routine. A DarkWake/clamshell window
     # otherwise drops back to sleep mid-run and truncates it (the 06-13 failure).
@@ -274,7 +309,16 @@ def cmd_routine():
     # apply REJOINED the routine 2026-06-16 (testing the full pipeline end-to-end).
     # It opens Gemini-fill windows, so it needs the Mac awake with a GUI session.
     # Reviewer runs LAST (on the backend) so it can grade the others' fresh output.
-    run_order = [a for a in order if a != "reviewer"]
+    #
+    # The backend's canonical order can include agents this runtime has no local
+    # runner for (e.g. 'sales' is defined backend-side but unimplemented here),
+    # which used to throw "No runner for agent" on every run. Skip those up front
+    # so a config-only agent never spams a daily failure — the reviewer is exempt
+    # because it runs on the backend, not through runners.RUNNERS.
+    skipped = [a for a in order if a not in ("reviewer",) and a not in runners.RUNNERS]
+    if skipped:
+        print(f"  ⤷ skipping {', '.join(skipped)}: no local runner (configured backend-side only)")
+    run_order = [a for a in order if a != "reviewer" and a in runners.RUNNERS]
     print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
     ok = 0
     for aid in run_order:
@@ -282,19 +326,21 @@ def cmd_routine():
         try:
             text = runners.run_agent(aid, sec, acfg.get("fields", {}),
                                      persona=acfg.get("persona", ""), client=c)
-            c.post_message(aid, text)              # → website feed
-            _tg_agent(aid, text)                   # → Telegram (each process messages you)
+            c.post_message(aid, text)              # → website feed (always)
+            if not scheduled:                      # scheduled = reviewer-only Telegram
+                _tg_agent(aid, text)
             ok += 1; print(f"  ✓ {aid}: posted")
         except Exception as e:
             print(f"  ✗ {aid}: {e}", file=sys.stderr)
-            _telegram(f"⚠️ {aid} failed in the morning routine: {str(e)[:300]}")
+            if not scheduled:                      # on schedule the reviewer flags failures
+                _telegram(f"⚠️ {aid} failed in the morning routine: {str(e)[:300]}")
     try:
         c.run_backend_agent("reviewer")            # audits the run via the backend
         print("  ✓ reviewer: audited the run")
-        try:                                       # mirror the reviewer's report to Telegram
+        try:                                       # mirror the reviewer's FULL report to Telegram
             rev = c.messages(agent="reviewer").get("messages", [])
             if rev:
-                _tg_agent("reviewer", rev[-1].get("text", ""))
+                _tg_agent_full("reviewer", rev[-1].get("text", ""))
         except Exception:
             pass
     except Exception as e:
@@ -346,7 +392,11 @@ def cmd_daemon():
             _save_state(state)
             _hold_awake(True)             # lock awake even on battery for the run
             try:
-                r = subprocess.run([PY, str(RUNTIME), "routine"], timeout=3600)
+                # PAIS_SCHEDULED marks this as the unattended run → reviewer-only
+                # Telegram. It survives the caffeinate execvp (inherited env), so
+                # the flag reaches cmd_routine even after the re-exec.
+                r = subprocess.run([PY, str(RUNTIME), "routine"],
+                                   env={**os.environ, "PAIS_SCHEDULED": "1"}, timeout=3600)
             finally:
                 _hold_awake(False)        # always release — else the Mac never sleeps
             if r.returncode == 0:
@@ -430,7 +480,7 @@ def main():
         elif cmd == "run" and rest:
             cmd_run(rest[0])
         elif cmd == "routine":
-            cmd_routine()
+            cmd_routine(scheduled=os.environ.get("PAIS_SCHEDULED") == "1")
         elif cmd == "daemon":
             cmd_daemon()
         elif cmd == "schedule":
