@@ -27,10 +27,20 @@ from pathlib import Path
 PAIS_DIR = Path.home() / ".pais"
 SCOUT_CACHE = PAIS_DIR / "scout_jobs.json"   # career run → apply run handoff
 
-# git diff lines that look like credentials — the code runner refuses to push them
-SECRET_PATTERNS = re.compile(
-    r"(api[_-]?key|secret|token|password|passwd|private[_-]?key|BEGIN (RSA|EC|OPENSSH) "
-    r"PRIVATE KEY|aws_access_key_id|sk-[A-Za-z0-9]{20,})", re.I)
+# The code runner refuses to push real secrets. Two PRECISE guards (mirrors
+# tools/repo_sync.py). NOT a broad keyword match — matching the literal words
+# "token"/"secret"/"password"/"api_key" false-blocked every push, because normal
+# source code is full of them (BRIDGE_TOKEN, gmail_app_password, …). That bug sat
+# the code agent at "⚠️ BLOCKED" for days. These match actual secret SHAPES + names.
+SECRET_CONTENT = re.compile(
+    r"(sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_\-]{30,}|xox[baprs]-[0-9A-Za-z\-]{10,}|"
+    r"AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"\b\d{6,10}:[A-Za-z0-9_\-]{30,}\b)")          # last = telegram bot token shape
+SECRET_NAMES = re.compile(
+    r"(^|/)(\.env(\..+)?|.*\.key|.*\.pem|.*\.session|.*\.keychain-db.*|"
+    r"\.keychain_pass|piontrix_leads\.json|application_profile\.md|JOB_APP_BRIEF\.md|"
+    r"brainscan_creators\.json|linkedin_targets\.json|applications\.json|"
+    r"job_queue\.json|scout_jobs\.json|id_rsa.*|.*\.p12|.*\.pfx)$", re.I)
 
 
 def _claude(prompt: str, tools: str | None = None, timeout: int = 600) -> str:
@@ -68,10 +78,42 @@ DESCRIPTIVE = (
 )
 
 
-# ── career: live web job scout ────────────────────────────────────────────────
-def run_career(secrets: dict, fields: dict, persona: str = "") -> str:
-    """Scout live job/internship postings matching the user's targets, rank by
-    fit, verify URLs, post the matches, and cache them for the apply agent."""
+# ── shared helpers for the merged Jobs agent ──────────────────────────────────
+def _agentic_path() -> str:
+    """Ensure ~/agentic_os is importable (it hosts the shared job_sheet + the
+    Gemini fill pipeline). Honors PAIS_FILL_DIR. Returns the resolved dir."""
+    fill_dir = os.path.expanduser(os.environ.get("PAIS_FILL_DIR", "~/agentic_os"))
+    if fill_dir not in sys.path:
+        sys.path.insert(0, fill_dir)
+    return fill_dir
+
+
+def _job_sheet():
+    """The shared vault job-pipeline module (source of truth). None if unavailable."""
+    try:
+        _agentic_path()
+        from tools import job_sheet  # type: ignore
+        return job_sheet
+    except Exception:
+        return None
+
+
+def _get_browser_fill(fields: dict):
+    """The Gemini-in-Chrome fill pipeline (owner only / optional). Disable via the
+    agent field gemini_fill=0. None ⇒ fall back to just opening the tab."""
+    if str(fields.get("gemini_fill", "1")).lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        _agentic_path()
+        from tools.browser_fill import browser_fill  # type: ignore
+        return browser_fill
+    except Exception:
+        return None
+
+
+def _scout_jobs(fields: dict, persona: str) -> list[dict]:
+    """Scout live job/internship postings matching the user's targets, verify the
+    URLs, rank by fit. Returns a list of job dicts (no posting / no side effects)."""
     roles = fields.get("target_roles") or "software engineering and data internships"
     locs = fields.get("locations") or "United States (remote welcome)"
     today = datetime.now().strftime("%Y-%m-%d")
@@ -95,23 +137,105 @@ def run_career(secrets: dict, fields: dict, persona: str = "") -> str:
             jobs = json.loads(m.group(0))
         except Exception:
             jobs = []
-    jobs = [j for j in jobs if str(j.get("url", "")).startswith("http")][:4]
-    if not jobs:
-        return f"Scouted for {roles} in {locs} but found no strong matches today — I'll keep looking."
-    try:                                   # hand the queue to the apply agent
+    return [j for j in jobs if isinstance(j, dict) and str(j.get("url", "")).startswith("http")][:4]
+
+
+def _fill_batch(batch: list[dict], fields: dict) -> tuple[list[str], list[str]]:
+    """Fill each job via Gemini-in-Chrome, verify by screenshot, and mark verified
+    fills as Applied in the pipeline. A job that can't be auto-verified (or when
+    the fill pipeline is unavailable) gracefully FALLS BACK to opening the tab so
+    Taran can finish it by hand — never a hard failure. After two consecutive
+    verify failures we stop driving Gemini and just open the remaining tabs (no
+    point fighting a broken panel five times). Returns (verified, opened) lines."""
+    browser_fill = _get_browser_fill(fields)
+    js = _job_sheet()
+    verified, opened, consec_fail = [], [], 0
+    for j in batch:
+        company, role, url = j.get("company", "?"), j.get("role", "?"), j.get("url", "")
+        if not browser_fill or consec_fail >= 2:
+            try:
+                webbrowser.open(url)
+                opened.append(f"• {company} — {role}\n  {url}  ↗ opened — fill it by hand")
+            except Exception:
+                pass
+            continue
+        try:
+            res = browser_fill(j, notify=False, start_task=True, poll=False)
+        except Exception as e:
+            res = {"ok": False, "error": f"fill crashed: {str(e)[:120]}", "screenshot_bytes": b""}
+        pic_ok, why = _verify_fill_screenshot(res, company, role)
+        if res.get("ok") and pic_ok:
+            consec_fail = 0
+            verified.append(f"• {company} — {role}\n  {url}  ✓ Gemini filling")
+            if js:
+                try:
+                    js.mark_applied(url)
+                except Exception:
+                    pass
+        else:
+            consec_fail += 1
+            reason = why if not pic_ok else (res.get("error") or f"status={res.get('status','?')}")
+            opened.append(f"• {company} — {role}\n  {url}  ⚠ opened — couldn't auto-verify ({reason}); finish by hand")
+    return verified, opened
+
+
+def _to_apply_rows(js, fallback: list[dict] | None = None) -> list[dict]:
+    """Oldest-first '🔍 To apply' rows from the vault pipeline (the FIFO the fill
+    pass works through). Falls back to a raw jobs list if the sheet is unavailable."""
+    if js:
+        try:
+            return [r for r in js.rows() if r.get("status") == js.DEFAULT_STATUS and r.get("url")]
+        except Exception:
+            pass
+    return fallback or []
+
+
+# ── jobs: the merged scout + apply agent ──────────────────────────────────────
+def run_jobs(secrets: dict, fields: dict, persona: str = "") -> dict:
+    """One agent: scout fresh roles → append to the vault Job Pipeline → drive the
+    Gemini fill on the oldest 'To apply' rows (open-tab fallback) → mark verified
+    fills Applied. Replaces the old split career + apply agents."""
+    js = _job_sheet()
+    scouted = []
+    try:
+        scouted = _scout_jobs(fields, persona)
+    except Exception as e:
+        scouted = []
+        scout_err = str(e)[:160]
+    else:
+        scout_err = ""
+    added = 0
+    if js and scouted:
+        try:
+            added = js.append_jobs(scouted)
+        except Exception:
+            added = 0
+    try:                                    # keep the legacy cache warm for other readers
         PAIS_DIR.mkdir(exist_ok=True)
-        SCOUT_CACHE.write_text(json.dumps(jobs, indent=2))
+        if scouted:
+            SCOUT_CACHE.write_text(json.dumps(scouted, indent=2))
     except Exception:
         pass
-    lines = [f"Found {len(jobs)} match{'es' if len(jobs) > 1 else ''} for {roles}:", ""]
-    for j in jobs:
-        loc = f" · {j['location']}" if j.get("location") else ""
-        lines.append(f"• {j.get('company','?')} — {j.get('role','?')}{loc}")
-        if j.get("why"):
-            lines.append(f"  {j['why']}")
-        lines.append(f"  {j.get('url','')}")
-    lines += ["", "Queued for the Job Apply agent — run it to open these applications on your screen."]
-    return "\n".join(lines)
+
+    cap = int(os.environ.get("APPLY_FILL_LIMIT", "5"))
+    batch = _to_apply_rows(js, fallback=scouted)[:cap]
+    if not batch:
+        head = (f"Scouted — added {added} new role(s) to your Job Pipeline." if added
+                else (f"Scouted, but found no fresh roles today ({scout_err})." if scout_err
+                      else "Scouted, but found no fresh roles and nothing is queued to apply to."))
+        return {"text": head + " Open the Jobs pipeline to review.", "actionable": bool(added)}
+
+    verified, opened = _fill_batch(batch, fields)
+    lines = [f"📋 Jobs run — {added} new role(s) scouted, {len(batch)} application(s) started."]
+    if verified:
+        lines.append(f"\n✅ Gemini is actively filling {len(verified)} (verified by screenshot):")
+        lines += verified
+    if opened:
+        lines.append(f"\n🖥️ Opened {len(opened)} for you to finish by hand:")
+        lines += opened
+    lines.append("\n⚠️ Review each form, attach your résumé, and submit yourself — nothing is "
+                 "submitted automatically. Track + edit status in your Jobs pipeline.")
+    return {"text": "\n".join(lines), "actionable": True}
 
 
 def _verify_fill_screenshot(res: dict, company: str, role: str) -> tuple[bool, str]:
@@ -154,90 +278,37 @@ def _verify_fill_screenshot(res: dict, company: str, role: str) -> tuple[bool, s
 
 # ── apply: open scouted applications — needs the user to finish ───────────────
 def run_apply(secrets: dict, fields: dict, persona: str = "") -> str:
-    """Fill / open every scouted application. On a machine with the local
-    Gemini-in-Chrome fill pipeline installed (the owner's setup) it DRIVES the
-    agentic fill — a window per job, brief sent to Gemini, 'Start task' clicked —
-    then VERIFIES each fill by screenshot. If a job can't be verified as filling,
-    it stops there and reports the apply as failed (rather than silently opening
-    windows that never filled). Everywhere else (customers) it just opens the page
-    for manual fill. Never submits — you review, attach your résumé, and submit."""
-    try:
-        jobs = json.loads(SCOUT_CACHE.read_text()) if SCOUT_CACHE.exists() else []
-    except Exception:
-        jobs = []
-    jobs = [j for j in jobs if str(j.get("url", "")).startswith("http")]
-    if not jobs:
-        return ("No scouted applications queued yet — run the Career agent first, "
-                "then run me to open its matches on your screen.")
-    cap = int(os.environ.get("APPLY_FILL_LIMIT", "5"))      # never spawn unbounded windows
-    batch = jobs[:cap]
-
-    # Owner power-fill: agentic Gemini-in-Chrome fill via the OPTIONAL local
-    # pipeline (~/agentic_os/tools/browser_fill.py — same one the old n8n
-    # apply-jobs / fill_scouted.py used). Guarded import: customers without it
-    # fall through to opening the tab. Disable with the agent field gemini_fill=0;
-    # point elsewhere with PAIS_FILL_DIR. Needs a real GUI session + Gemini-in-
-    # Chrome, so a frozen/headless morning will fall back to open-tab.
-    browser_fill = None
-    if str(fields.get("gemini_fill", "1")).lower() not in ("0", "false", "no", "off"):
+    """Fill the oldest '🔍 To apply' rows already in the Job Pipeline — no scouting.
+    Drives the Gemini-in-Chrome fill, verifies each by screenshot, marks verified
+    fills Applied, and gracefully opens a tab for any it can't auto-verify. Kept
+    for back-compat; the merged 'jobs' agent scouts + fills in one pass. Never
+    submits — you review, attach your résumé, and submit yourself."""
+    js = _job_sheet()
+    fallback = []
+    if not js:                              # legacy: no vault sheet → old scout cache
         try:
-            fill_dir = os.path.expanduser(os.environ.get("PAIS_FILL_DIR", "~/agentic_os"))
-            if fill_dir not in sys.path:
-                sys.path.insert(0, fill_dir)
-            from tools.browser_fill import browser_fill  # type: ignore
+            jobs = json.loads(SCOUT_CACHE.read_text()) if SCOUT_CACHE.exists() else []
+            fallback = [j for j in jobs if str(j.get("url", "")).startswith("http")]
         except Exception:
-            browser_fill = None
-
-    if browser_fill:
-        # Fire-and-VERIFY, one job at a time. For each job we actually trigger the
-        # Gemini fill (start_task=True — the prior start_task=False only pasted the
-        # brief and never clicked Start task, so nothing ever filled), then take a
-        # picture and confirm Gemini is filling. The gate needs BOTH signals:
-        #   • browser_fill ok  → the 'Start task' button was consumed (OCR check)
-        #   • vision FILLED    → the screenshot shows the form actually filling
-        # On the FIRST job that fails verification we STOP — no point opening more
-        # windows when the pipeline is broken — and report the apply as failed.
-        verified = []
-        for j in batch:
-            company, role, url = j.get("company", "?"), j.get("role", "?"), j.get("url", "")
-            try:
-                res = browser_fill(j, notify=False, start_task=True, poll=False)
-            except Exception as e:
-                res = {"ok": False, "error": f"fill crashed: {str(e)[:120]}", "screenshot_bytes": b""}
-            pic_ok, why = _verify_fill_screenshot(res, company, role)
-            if not (res.get("ok") and pic_ok):
-                reason = why if not pic_ok else (res.get("error") or f"status={res.get('status','?')}")
-                done = len(verified)
-                msg = (f"❌ JOB APPLY FAILED — stopped after {done} of {len(batch)} job(s).\n\n"
-                       f"Could not verify Gemini filled:\n• {company} — {role}\n  {url}\n"
-                       f"  reason: {reason}\n\n")
-                if verified:
-                    msg += "Verified filling before the stop:\n" + "\n".join(verified) + "\n\n"
-                msg += ("Open that job's Chrome window and finish it by hand, or re-run the "
-                        "Apply agent. Nothing was submitted.")
-                return msg
-            verified.append(f"• {company} — {role}\n  {url}  ✓ verified filling")
-        return (f"✅ Gemini fill VERIFIED for all {len(verified)} job(s) — each form is "
-                f"actively being filled (confirmed by screenshot). Review the fields, fix "
-                f"any small errors, attach your résumé, and submit yourself. Nothing is "
-                f"submitted without you.\n\n" + "\n".join(verified))
-
-    # Portable fallback (customers / no GUI): just open the pages for manual fill.
-    opened = []
-    for j in batch:
-        try:
-            webbrowser.open(j["url"])
-            opened.append(f"• {j.get('company','?')} — {j.get('role','?')}\n  {j['url']}")
-        except Exception:
-            pass
-    if not opened:
-        return "The scout queue had no openable URLs — run the Career agent again."
-    return (
-        f"🖥️ Opened {len(opened)} application page(s) in your browser:\n\n"
-        + "\n".join(opened)
-        + "\n\n⚠️ NEEDS YOUR ATTENTION — for each tab: complete the form, attach "
-          "your résumé, and click Submit yourself. Nothing is submitted without you."
-    )
+            fallback = []
+    batch = _to_apply_rows(js, fallback=fallback)[:int(os.environ.get("APPLY_FILL_LIMIT", "5"))]
+    if not batch:
+        return ("Nothing queued to apply to — run the Jobs agent to scout fresh roles, "
+                "then I'll open and fill them on your screen.")
+    verified, opened = _fill_batch(batch, fields)
+    lines = []
+    if verified:
+        lines.append(f"✅ Gemini is actively filling {len(verified)} application(s) (verified):")
+        lines += verified
+    if opened:
+        lines.append(f"\n🖥️ Opened {len(opened)} for you to finish by hand:")
+        lines += opened
+    if not lines:
+        return ("Couldn't start any applications — is the Mac awake with Chrome + the "
+                "Gemini panel available? Nothing was submitted.")
+    lines.append("\n⚠️ Review each form, attach your résumé, and submit yourself. Nothing "
+                 "is submitted automatically.")
+    return "\n".join(lines)
 
 
 # ── email: read-only Gmail IMAP triage ────────────────────────────────────────
@@ -532,18 +603,31 @@ def run_code(secrets: dict, fields: dict, persona: str = "") -> str:
             else:
                 report.append(f"• {rp}: clean, nothing to ship")
             continue
-        diff = git("diff").stdout + git("diff", "--cached").stdout + status
-        if SECRET_PATTERNS.search(diff):
-            report.append(f"• {rp}: ⚠️ BLOCKED — changes look like they contain a secret "
-                          f"(key/token/password). Review by hand; I won't push this.")
-            continue
+        # Stage first (respects .gitignore), THEN scan the full staged diff — the
+        # only way to also catch secrets in NEW (untracked) files. Unstage if the
+        # guard trips, so we leave the repo exactly as we found it.
         git("add", "-A")
+        staged_names = git("diff", "--cached", "--name-only").stdout
+        staged_diff = git("diff", "--cached").stdout
+        bad_name = next((f for f in staged_names.splitlines() if SECRET_NAMES.search(f)), None)
+        if bad_name:
+            git("reset", "-q")
+            report.append(f"• {rp}: ⚠️ BLOCKED — a secret/PII file ({bad_name}) is staged; "
+                          f"add it to .gitignore. I won't push this.")
+            continue
+        if SECRET_CONTENT.search(staged_diff):
+            git("reset", "-q")
+            report.append(f"• {rp}: ⚠️ BLOCKED — the diff contains something shaped like a real "
+                          f"key/token. Review by hand; I won't push this.")
+            continue
         n = len(status.splitlines())
         commit = git("commit", "-m", f"chore: pais auto-sync ({n} file(s))")
         if commit.returncode != 0:
             report.append(f"• {rp}: commit failed — {commit.stderr.strip()[:120]}")
             continue
         push = git("push")
+        if push.returncode != 0 and "no upstream" in (push.stderr or "").lower():
+            push = git("push", "-u", "origin", "HEAD")     # first push of a new branch
         report.append(f"• {rp}: committed + pushed {n} file(s)"
                       if push.returncode == 0
                       else f"• {rp}: committed locally; push failed — {push.stderr.strip()[:120]}")
@@ -590,8 +674,9 @@ def run_assistant(secrets: dict, fields: dict, persona: str = "") -> str:
 
 # agent id → runner (mirrors the n8n / morning_stack workflows)
 RUNNERS = {
-    "career":    run_career,      # live web job scout → queues for apply
-    "apply":     run_apply,       # opens applications on screen — needs the user
+    "jobs":      run_jobs,        # MERGED: scout fresh roles → pipeline → Gemini fill
+    "career":    run_jobs,        # back-compat alias (old routine order) → merged agent
+    "apply":     run_apply,       # back-compat: fill queued 'To apply' rows (no scout)
     "briefing":  run_briefing,    # feed-grounded daily brief
     "email":     run_email,       # read-only Gmail IMAP triage
     "outreach":  run_outreach,    # prospect + draft for review (never sends)
