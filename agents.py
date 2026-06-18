@@ -376,10 +376,22 @@ def _create_gmail_draft(addr: str, pw: str, to: str, subject: str, body: str) ->
             pass
 
 
+# The fixed local-business pitch. Reproduced near-verbatim per prospect — only
+# the business name and the one "money leaks — for example …" clause are tailored.
+OUTREACH_TEMPLATE = (
+    "Hi, is this the owner? I'll be quick — my name's Taran, I'm local here in "
+    "Collegeville. I help [Business] plug money leaks — for example the calls you "
+    "miss when it's slammed, and the regulars who quietly stop coming in. I'm "
+    "setting the first few places up free for 30 days. Can I swing by and show you "
+    "what it'd look like with [Business]'s name on it — ten minutes?"
+)
+
+
 def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
-    """Find 2 relevant prospects on the live web, resolve a real contact email
-    (Hunter, then site scrape), and SAVE a ready-to-send Gmail draft for each —
-    posted for the user's review. This runner NEVER sends anything."""
+    """Find 2 local businesses on the live web, resolve a real contact email
+    (Hunter, then site scrape), and SAVE a ready-to-send Gmail draft for each
+    using the fixed local-business template (tailored per business) — posted for
+    the user's review. This runner NEVER sends anything."""
     company = fields.get("company") or ""
     sender = fields.get("sender_name") or "the user"
     if not company:
@@ -387,13 +399,23 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
             "Tell me about your company/project in my settings (the 'Company / project' "
             "field) and I'll start finding prospects and drafting outreach.")}
     prompt = (
-        f"You are a BD rep for {sender}'s company/project: {company}.\n"
+        f"You are doing local cold outreach for {sender}'s business: {company}.\n"
         f"{_settings_block(persona, fields)}\n"
-        f"Use WebSearch to find 2 SPECIFIC, real prospects (businesses or people) who would "
-        f"genuinely benefit from {company} right now — name them, with their website domain. "
-        f"Then write a complete, warm, specific outreach email for EACH (subject + full body, "
-        f"in the user's voice, never salesy, ~120 words each).\n\n"
-        f"Output for each prospect:\nPROSPECT: <name> | <domain>\nSUBJECT: <line>\n<body>\n---\n"
+        f"Use WebSearch to find 2 SPECIFIC, real LOCAL brick-and-mortar businesses in the "
+        f"Collegeville / Phoenixville / King of Prussia, PA area (e.g. restaurants, salons, "
+        f"shops, auto, dental) that would benefit from plugging missed-call and lapsed-regular "
+        f"revenue leaks. Name each one with its website domain.\n\n"
+        f"For EACH business, write the outreach email body by reproducing this template "
+        f"EXACTLY, word for word, with only two changes:\n"
+        f"  1) replace every [Business] with the real business name;\n"
+        f"  2) tailor ONLY the 'for example …' clause so the money-leak examples fit that "
+        f"business type (keep it to one short clause, same sentence shape).\n"
+        f"Do not add, drop, or reorder any other sentence. Keep Taran's voice and the "
+        f"casual, no-pressure tone.\n\n"
+        f"TEMPLATE:\n{OUTREACH_TEMPLATE}\n\n"
+        f"Also write a SHORT, casual, lowercase subject line for each (e.g. \"quick idea for "
+        f"<business>\").\n\n"
+        f"Output for each business:\nPROSPECT: <name> | <domain>\nSUBJECT: <line>\n<body>\n---\n"
     )
     drafts = _claude(prompt, tools="WebSearch,WebFetch", timeout=600)
 
