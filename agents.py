@@ -295,16 +295,97 @@ def run_email(secrets: dict, fields: dict, persona: str = "") -> str:
     return _claude(prompt, timeout=240)
 
 
-# ── outreach: prospect + draft for review (never sends) ───────────────────────
-def run_outreach(secrets: dict, fields: dict, persona: str = "") -> str:
-    """Find 2 relevant prospects on the live web, look up a contact email via
-    Hunter when a key is set, and draft full outreach emails — posted for the
-    user's review. This runner NEVER sends anything."""
+# ── outreach: prospect + draft for review (saves Gmail drafts, never sends) ────
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# emails we never want to treat as a real human contact
+_EMAIL_JUNK = ("example.com", "sentry.io", "wixpress.com", "domain.com", "email.com",
+               "yourdomain", "godaddy.com", "squarespace.com")
+
+
+def _parse_prospects(text: str) -> list[dict]:
+    """Pull structured prospects out of the claude draft block. Tolerant of the
+    preamble/sources claude adds around the PROSPECT/SUBJECT/body format."""
+    out = []
+    for block in re.split(r"(?m)^PROSPECT:\s*", text)[1:]:
+        head = (block.splitlines() or [""])[0]
+        name, _, dom_part = head.partition("|")
+        md = re.search(r"([\w.-]+\.\w{2,})", dom_part)
+        ms = re.search(r"(?m)^SUBJECT:\s*(.+)$", block)
+        if not (name.strip() and ms):
+            continue
+        body = re.split(r"(?m)^\s*-{3,}\s*$|^Sources:", block[ms.end():])[0].strip()
+        out.append({"name": name.strip(), "domain": (md.group(1) if md else "").lower(),
+                    "subject": ms.group(1).strip(), "body": body})
+    return out
+
+
+def _resolve_contact(domain: str, hunter: str) -> str:
+    """Best-effort contact email for a domain: Hunter domain-search first, then
+    scrape the site's own pages for a mailto. Returns '' when nothing is found."""
+    if not domain:
+        return ""
+    import requests
+    if hunter:
+        try:
+            r = requests.get("https://api.hunter.io/v2/domain-search",
+                             params={"domain": domain, "api_key": hunter, "limit": 1},
+                             timeout=20)
+            emails = (r.json().get("data") or {}).get("emails") or []
+            if emails and emails[0].get("value"):
+                return emails[0]["value"]
+        except Exception:
+            pass
+    # Fallback: small/local businesses Hunter doesn't index — read their own site.
+    for path in ("", "/contact", "/contact-us", "/about"):
+        try:
+            r = requests.get(f"https://{domain}{path}", timeout=15,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            found = [e for e in _EMAIL_RE.findall(r.text)
+                     if not e.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"))
+                     and not any(j in e.lower() for j in _EMAIL_JUNK)]
+            if found:                       # prefer an address on the prospect's own domain
+                same = [e for e in found if e.lower().endswith("@" + domain)]
+                return (same or found)[0]
+        except Exception:
+            pass
+    return ""
+
+
+def _create_gmail_draft(addr: str, pw: str, to: str, subject: str, body: str) -> bool:
+    """Append a draft to the user's Gmail Drafts over IMAP. Saving a draft is NOT
+    sending — the user still reviews and hits send by hand."""
+    import imaplib
+    import time
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["From"] = addr
+    if to:
+        msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    M = imaplib.IMAP4_SSL("imap.gmail.com", timeout=60)
+    try:
+        M.login(addr, pw)
+        M.append('"[Gmail]/Drafts"', "\\Draft",
+                 imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+        return True
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
+    """Find 2 relevant prospects on the live web, resolve a real contact email
+    (Hunter, then site scrape), and SAVE a ready-to-send Gmail draft for each —
+    posted for the user's review. This runner NEVER sends anything."""
     company = fields.get("company") or ""
     sender = fields.get("sender_name") or "the user"
     if not company:
-        return ("Tell me about your company/project in my settings (the 'Company / project' "
-                "field) and I'll start finding prospects and drafting outreach.")
+        return {"actionable": False, "text": (
+            "Tell me about your company/project in my settings (the 'Company / project' "
+            "field) and I'll start finding prospects and drafting outreach.")}
     prompt = (
         f"You are a BD rep for {sender}'s company/project: {company}.\n"
         f"{_settings_block(persona, fields)}\n"
@@ -316,30 +397,42 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> str:
     )
     drafts = _claude(prompt, tools="WebSearch,WebFetch", timeout=600)
 
-    # Optional: resolve a real contact email for each prospect domain via Hunter.
     hunter = secrets.get("hunter_api_key", "")
-    contacts = []
-    if hunter:
-        import requests
-        for dom in re.findall(r"PROSPECT:.*?\|\s*([\w.-]+\.\w{2,})", drafts)[:2]:
+    addr = secrets.get("gmail_address", "")
+    pw = secrets.get("gmail_app_password", "")
+    prospects = _parse_prospects(drafts)
+
+    saved, lines = 0, []
+    for p in prospects:
+        email = _resolve_contact(p["domain"], hunter)
+        drafted = False
+        if addr and pw:
             try:
-                r = requests.get("https://api.hunter.io/v2/domain-search",
-                                 params={"domain": dom, "api_key": hunter, "limit": 1},
-                                 timeout=20)
-                emails = (r.json().get("data") or {}).get("emails") or []
-                if emails:
-                    contacts.append(f"• {dom}: {emails[0].get('value')} "
-                                    f"({emails[0].get('position') or 'contact'})")
-            except Exception:
-                pass
+                drafted = _create_gmail_draft(addr, pw, email, p["subject"], p["body"])
+            except Exception as e:
+                lines.append(f"• {p['name']}: draft NOT saved ({str(e)[:80]})")
+                continue
+        if drafted:
+            saved += 1
+            lines.append(f"• {p['name']} → " + (
+                f"To: {email}" if email
+                else "no address found — saved with blank To, add a recipient before sending"))
+        elif email:
+            lines.append(f"• {p['name']}: found {email} (connect Gmail to auto-save the draft)")
+
     out = "Outreach drafts ready for your review (nothing has been sent):\n\n" + drafts
-    if contacts:
-        out += "\n\nCONTACT EMAILS FOUND (Hunter):\n" + "\n".join(contacts)
-    elif hunter:
-        out += "\n\nNo contact emails found via Hunter for these domains."
+    if not (addr and pw):
+        out += ("\n\nConnect Gmail (address + app password) in my settings and I'll save each "
+                "of these as a ready-to-send draft in your Gmail.")
+    elif saved:
+        out += (f"\n\nSAVED {saved} GMAIL DRAFT(S) — review in Gmail → Drafts and hit send:\n"
+                + "\n".join(lines))
+    elif lines:
+        out += "\n\nGMAIL DRAFTS:\n" + "\n".join(lines)
     else:
-        out += "\n\nAdd a Hunter.io key in my settings and I'll find contact emails too."
-    return out
+        out += "\n\nNo prospects could be parsed from the draft — nothing to save this run."
+
+    return {"actionable": saved > 0, "text": out}
 
 
 # ── linkedin: one connect draft per run ───────────────────────────────────────
@@ -483,10 +576,18 @@ RUNNERS = {
 }
 
 
-def run_agent(agent: str, secrets: dict, fields: dict, persona: str = "", client=None) -> str:
+def run_agent(agent: str, secrets: dict, fields: dict, persona: str = "",
+              client=None) -> tuple[str, bool]:
+    """Run a teammate and return (text_for_feed, actionable). A runner may return a
+    plain string (always treated as actionable) or a dict {text, actionable} so it
+    can signal that it ran but produced nothing the user can act on yet."""
     runner = RUNNERS.get(agent)
     if not runner:
         raise RuntimeError(f"No runner for agent '{agent}'.")
     if runner is run_briefing:
-        return runner(secrets, fields, persona, client=client)
-    return runner(secrets, fields, persona)
+        result = runner(secrets, fields, persona, client=client)
+    else:
+        result = runner(secrets, fields, persona)
+    if isinstance(result, dict):
+        return result.get("text", ""), bool(result.get("actionable", True))
+    return result, True

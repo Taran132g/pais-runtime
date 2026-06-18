@@ -267,11 +267,12 @@ def cmd_run(agent: str):
     c = PaisClient()
     sec = c.secrets().get("connections", {})
     acfg = c.config().get("agents", {}).get(agent, {}) or {}
-    text = runners.run_agent(agent, sec, acfg.get("fields", {}),
-                             persona=acfg.get("persona", ""), client=c)
+    text, actionable = runners.run_agent(agent, sec, acfg.get("fields", {}),
+                                         persona=acfg.get("persona", ""), client=c)
     c.post_message(agent, text)
     _tg_agent_full(agent, text)                    # → Telegram, FULL output (manual run)
-    print(f"✓ {agent}: posted to your website feed + Telegram")
+    note = "" if actionable else " (ran, but no actionable output — check its settings)"
+    print(f"✓ {agent}: posted to your website feed + Telegram{note}")
 
 
 def cmd_routine(scheduled: bool = False):
@@ -320,16 +321,24 @@ def cmd_routine(scheduled: bool = False):
         print(f"  ⤷ skipping {', '.join(skipped)}: no local runner (configured backend-side only)")
     run_order = [a for a in order if a != "reviewer" and a in runners.RUNNERS]
     print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
+    # Scheduled runs are reviewer-only on Telegram, but these agents produce a
+    # ready-to-act deliverable (e.g. Gmail drafts) that's worthless if it only
+    # lands on the web feed — so they always reach the phone when actionable.
+    ALWAYS_TG = {"outreach"}
     ok = 0
     for aid in run_order:
         acfg = agents_cfg.get(aid, {}) or {}
         try:
-            text = runners.run_agent(aid, sec, acfg.get("fields", {}),
-                                     persona=acfg.get("persona", ""), client=c)
+            text, actionable = runners.run_agent(aid, sec, acfg.get("fields", {}),
+                                                  persona=acfg.get("persona", ""), client=c)
             c.post_message(aid, text)              # → website feed (always)
-            if not scheduled:                      # scheduled = reviewer-only Telegram
+            if not scheduled:                      # scheduled = reviewer-only Telegram …
                 _tg_agent(aid, text)
-            ok += 1; print(f"  ✓ {aid}: posted")
+            elif aid in ALWAYS_TG and actionable:  # … except ready-to-act deliverables
+                _tg_agent_full(aid, text)
+            ok += 1
+            print(f"  ✓ {aid}: posted" if actionable
+                  else f"  ⚠ {aid}: ran, no actionable output")
         except Exception as e:
             print(f"  ✗ {aid}: {e}", file=sys.stderr)
             if not scheduled:                      # on schedule the reviewer flags failures
