@@ -300,8 +300,24 @@ def cmd_routine(scheduled: bool = False):
 
     import agents as runners
     c = PaisClient()
-    cfg = c.config()
-    sec = c.secrets().get("connections", {})
+    # Auth/backend pre-check: fail fast with ONE clear alert instead of letting a
+    # rejected token or unreachable backend take the whole run down silently. Before
+    # this, config()/secrets() threw uncaught at the top — the daemon logged a
+    # traceback, nothing hit Telegram, and Taran just saw a zero-run with no reason
+    # why (the 06-12/13 failures). The alert fires even on scheduled runs: a total
+    # auth failure is exactly when you need to know, reviewer-only gating aside.
+    try:
+        c._access_token()                       # validate auth first (precise error)
+        cfg = c.config()
+        sec = c.secrets().get("connections", {})
+    except NotLoggedIn as e:
+        msg = f"⚠️ PAIS morning routine aborted — auth failed: {e}"
+        print(msg, file=sys.stderr); _telegram_alert(msg)
+        return
+    except Exception as e:                       # backend down / network / timeout
+        msg = f"⚠️ PAIS morning routine aborted — couldn't reach the backend: {str(e)[:200]}"
+        print(msg, file=sys.stderr); _telegram_alert(msg)
+        return
     agents_cfg = cfg.get("agents", {})
     order = [a for a in cfg.get("routine", {}).get("order", []) if a]
     if not order:
