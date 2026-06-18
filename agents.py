@@ -383,7 +383,7 @@ OUTREACH_TEMPLATE = (
     "Collegeville. I help [Business] plug money leaks — for example the calls you "
     "miss when it's slammed, and the regulars who quietly stop coming in. I'm "
     "setting the first few places up free for 30 days. Can I swing by and show you "
-    "what it'd look like with [Business]'s name on it — ten minutes?"
+    "what it'd look like with [ShortName]'s name on it — ten minutes?"
 )
 
 
@@ -406,10 +406,13 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
         f"shops, auto, dental) that would benefit from plugging missed-call and lapsed-regular "
         f"revenue leaks. Name each one with its website domain.\n\n"
         f"For EACH business, write the outreach email body by reproducing this template "
-        f"EXACTLY, word for word, with only two changes:\n"
-        f"  1) replace every [Business] with the real business name;\n"
+        f"EXACTLY, word for word, with only these changes:\n"
+        f"  1) replace [Business] with the real business name;\n"
         f"  2) tailor ONLY the 'for example …' clause so the money-leak examples fit that "
-        f"business type (keep it to one short clause, same sentence shape).\n"
+        f"business type (keep it to one short clause, same sentence shape);\n"
+        f"  3) replace [ShortName] with a SHORT, natural form of the name (drop trailing "
+        f"descriptors like 'Automotive Specialties', 'Drive-In', 'Spin and Fitness') so the "
+        f"possessive reads naturally — e.g. Jim's, Speck's, Stride.\n"
         f"Do not add, drop, or reorder any other sentence. Keep Taran's voice and the "
         f"casual, no-pressure tone.\n\n"
         f"TEMPLATE:\n{OUTREACH_TEMPLATE}\n\n"
