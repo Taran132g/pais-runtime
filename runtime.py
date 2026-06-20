@@ -294,9 +294,13 @@ def cmd_routine(scheduled: bool = False):
     # Re-exec once under caffeinate; the env guard prevents a loop, and it no-ops
     # where caffeinate is absent (non-mac). The daemon runs us as a SUBPROCESS,
     # so this exec replaces the routine process only — never the daemon loop.
+    # -d keeps the DISPLAY awake too: the apply agent's Gemini-in-Chrome fill is
+    # GUI automation (AppleScript keystrokes + window capture) that needs a lit
+    # screen. The assertion releases when this process exits — i.e. right after
+    # the reviewer sends its Telegram report — so the display then sleeps normally.
     if os.environ.get("PAIS_CAFFEINATED") != "1" and shutil.which("caffeinate"):
         os.environ["PAIS_CAFFEINATED"] = "1"
-        os.execvp("caffeinate", ["caffeinate", "-imsu", PY, str(RUNTIME), "routine"])
+        os.execvp("caffeinate", ["caffeinate", "-dimsu", PY, str(RUNTIME), "routine"])
 
     import agents as runners
     c = PaisClient()

@@ -140,42 +140,79 @@ def _scout_jobs(fields: dict, persona: str) -> list[dict]:
     return [j for j in jobs if isinstance(j, dict) and str(j.get("url", "")).startswith("http")][:4]
 
 
-def _fill_batch(batch: list[dict], fields: dict) -> tuple[list[str], list[str]]:
-    """Fill each job via Gemini-in-Chrome, verify by screenshot, and mark verified
-    fills as Applied in the pipeline. A job that can't be auto-verified (or when
-    the fill pipeline is unavailable) gracefully FALLS BACK to opening the tab so
-    Taran can finish it by hand — never a hard failure. After two consecutive
-    verify failures we stop driving Gemini and just open the remaining tabs (no
-    point fighting a broken panel five times). Returns (verified, opened) lines."""
-    browser_fill = _get_browser_fill(fields)
-    js = _job_sheet()
-    verified, opened, consec_fail = [], [], 0
+def _open_tabs(batch: list[dict]) -> list[str]:
+    """Last-resort fallback: just open each job URL in the default browser."""
+    opened = []
     for j in batch:
         company, role, url = j.get("company", "?"), j.get("role", "?"), j.get("url", "")
-        if not browser_fill or consec_fail >= 2:
-            try:
-                webbrowser.open(url)
-                opened.append(f"• {company} — {role}\n  {url}  ↗ opened — fill it by hand")
-            except Exception:
-                pass
-            continue
         try:
-            res = browser_fill(j, notify=False, start_task=True, poll=False)
-        except Exception as e:
-            res = {"ok": False, "error": f"fill crashed: {str(e)[:120]}", "screenshot_bytes": b""}
-        pic_ok, why = _verify_fill_screenshot(res, company, role)
-        if res.get("ok") and pic_ok:
-            consec_fail = 0
-            verified.append(f"• {company} — {role}\n  {url}  ✓ Gemini filling")
+            webbrowser.open(url)
+            opened.append(f"• {company} — {role}\n  {url}  ↗ opened — fill it by hand")
+        except Exception:
+            pass
+    return opened
+
+
+def _fill_batch(batch: list[dict], fields: dict) -> tuple[list[str], list[str]]:
+    """Fill each job by driving the REAL page DOM via Playwright (tools/pais_browser),
+    in ONE browser with N tabs left open for review. This replaces the old blind
+    OCR/coordinate clicking (tools/browser_fill), which kept missing the form and
+    firing pyautogui clicks into the Dock — opening random apps instead of filling.
+
+    Verified fills (≥1 field filled) are marked Applied in the pipeline; a job with
+    no fillable form (login-walled Workday/iCIMS) gracefully reports as opened-for-
+    manual — never a hard failure. Returns (verified, opened) lines.
+
+    The fill runs in a daemon thread so the browser can stay OPEN (keep_open) after
+    this returns its summary; we wait up to FILL_WAIT seconds for the fills to land,
+    then report. Disable entirely with the agent field gemini_fill=0."""
+    import threading
+
+    js = _job_sheet()
+    if str(fields.get("gemini_fill", "1")).lower() in ("0", "false", "no", "off"):
+        return [], _open_tabs(batch)
+    try:
+        _agentic_path()
+        from tools.pais_browser import browser_fill_pw_batch  # type: ignore
+    except Exception:
+        return [], _open_tabs(batch)
+
+    results_box: dict[str, dict] = {}
+    done = threading.Event()
+
+    def _after(results: list[dict]) -> None:
+        for j, r in zip(batch, results):
+            results_box[j.get("url", "")] = r
+        done.set()
+
+    keep = int(os.environ.get("FILL_KEEP_OPEN", "1800"))
+
+    def _runner() -> None:
+        try:
+            browser_fill_pw_batch(batch, keep_open_seconds=keep, after_fill=_after)
+        except Exception:
+            done.set()                          # never leave the caller hanging
+
+    threading.Thread(target=_runner, daemon=True).start()
+    # Wait for the fills to land (the browser keeps running past this in the thread).
+    if not done.wait(timeout=int(os.environ.get("FILL_WAIT", "150"))):
+        return [], _open_tabs(batch)            # filler stalled → fall back to tabs
+
+    verified, opened = [], []
+    for j in batch:
+        company, role, url = j.get("company", "?"), j.get("role", "?"), j.get("url", "")
+        r = results_box.get(url) or {}
+        if r.get("ok"):
+            n = len(r.get("filled", []))
+            verified.append(f"• {company} — {role}\n  {url}  ✓ {n} field(s) filled")
             if js:
                 try:
                     js.mark_applied(url)
                 except Exception:
                     pass
         else:
-            consec_fail += 1
-            reason = why if not pic_ok else (res.get("error") or f"status={res.get('status','?')}")
-            opened.append(f"• {company} — {role}\n  {url}  ⚠ opened — couldn't auto-verify ({reason}); finish by hand")
+            reason = (r.get("error") or "no fillable form / login-walled")[:55]
+            opened.append(f"• {company} — {role}\n  {url}  ⚠ open in a tab — finish by hand ({reason})")
     return verified, opened
 
 
@@ -447,15 +484,10 @@ def _create_gmail_draft(addr: str, pw: str, to: str, subject: str, body: str) ->
             pass
 
 
-# The fixed local-business pitch. Reproduced near-verbatim per prospect — only
-# the business name and the one "money leaks — for example …" clause are tailored.
-OUTREACH_TEMPLATE = (
-    "Hi, is this the owner? I'll be quick — my name's Taran, I'm local here in "
-    "Collegeville. I help [Business] plug money leaks — for example the calls you "
-    "miss when it's slammed, and the regulars who quietly stop coming in. I'm "
-    "setting the first few places up free for 30 days. Can I swing by and show you "
-    "what it'd look like with [ShortName]'s name on it — ten minutes?"
-)
+# The fixed local-business pitch + signature live in ~/agentic_os/outreach_pitch.py
+# — the single source of truth shared with piontrix_outreach.py so they never drift.
+# Imported lazily inside run_outreach() so a missing shared module degrades only
+# outreach (with a clear message) rather than breaking the whole runtime import.
 
 
 def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
@@ -469,6 +501,16 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
         return {"actionable": False, "text": (
             "Tell me about your company/project in my settings (the 'Company / project' "
             "field) and I'll start finding prospects and drafting outreach.")}
+    # Pitch + signature: single source of truth shared with piontrix_outreach.py.
+    try:
+        _shared = str(Path.home() / "agentic_os")
+        if _shared not in sys.path:
+            sys.path.insert(0, _shared)
+        from outreach_pitch import PITCH_TEMPLATE, with_signature
+    except Exception as e:
+        return {"actionable": False, "text": (
+            "Outreach pitch module is missing (~/agentic_os/outreach_pitch.py); "
+            f"can't draft until it's restored. ({e})")}
     prompt = (
         f"You are doing local cold outreach for {sender}'s business: {company}.\n"
         f"{_settings_block(persona, fields)}\n"
@@ -477,16 +519,12 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
         f"shops, auto, dental) that would benefit from plugging missed-call and lapsed-regular "
         f"revenue leaks. Name each one with its website domain.\n\n"
         f"For EACH business, write the outreach email body by reproducing this template "
-        f"EXACTLY, word for word, with only these changes:\n"
-        f"  1) replace [Business] with the real business name;\n"
-        f"  2) tailor ONLY the 'for example …' clause so the money-leak examples fit that "
-        f"business type (keep it to one short clause, same sentence shape);\n"
-        f"  3) replace [ShortName] with a SHORT, natural form of the name (drop trailing "
-        f"descriptors like 'Automotive Specialties', 'Drive-In', 'Spin and Fitness') so the "
-        f"possessive reads naturally — e.g. Jim's, Speck's, Stride.\n"
-        f"Do not add, drop, or reorder any other sentence. Keep Taran's voice and the "
-        f"casual, no-pressure tone.\n\n"
-        f"TEMPLATE:\n{OUTREACH_TEMPLATE}\n\n"
+        f"EXACTLY, word for word, with only this change:\n"
+        f"  - tailor ONLY the 'money leaks like …' clause so the two examples fit that "
+        f"business type (keep it to one short clause, same sentence shape, two examples).\n"
+        f"Do NOT name the business as someone Taran already helps, and do not add, drop, "
+        f"or reorder any other sentence. Keep Taran's voice and the casual, no-pressure tone.\n\n"
+        f"TEMPLATE:\n{PITCH_TEMPLATE}\n\n"
         f"Also write a SHORT, casual, lowercase subject line for each (e.g. \"quick idea for "
         f"<business>\").\n\n"
         f"Output for each business:\nPROSPECT: <name> | <domain>\nSUBJECT: <line>\n<body>\n---\n"
@@ -501,10 +539,12 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
     saved, lines = 0, []
     for p in prospects:
         email = _resolve_contact(p["domain"], hunter)
+        # Append Taran's signature once (the model is told not to add one).
+        body = with_signature(p["body"])
         drafted = False
         if addr and pw:
             try:
-                drafted = _create_gmail_draft(addr, pw, email, p["subject"], p["body"])
+                drafted = _create_gmail_draft(addr, pw, email, p["subject"], body)
             except Exception as e:
                 lines.append(f"• {p['name']}: draft NOT saved ({str(e)[:80]})")
                 continue
