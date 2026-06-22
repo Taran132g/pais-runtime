@@ -21,6 +21,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import webbrowser
 from datetime import datetime
@@ -210,67 +211,40 @@ def _open_tabs(batch: list[dict]) -> list[str]:
     return opened
 
 
-def _fill_batch(batch: list[dict], fields: dict) -> tuple[list[str], list[str]]:
-    """Fill each job by driving the REAL page DOM via Playwright (tools/pais_browser),
-    in ONE browser with N tabs left open for review. This replaces the old blind
-    OCR/coordinate clicking (tools/browser_fill), which kept missing the form and
-    firing pyautogui clicks into the Dock — opening random apps instead of filling.
+def _spawn_fill(batch: list[dict], fields: dict) -> bool:
+    """Launch the Playwright fill as a DETACHED process (fill_worker.py) that OUTLIVES
+    the routine. The routine exits a few minutes after the reviewer; the old in-process
+    daemon-thread fill got killed at that exit and only had a 150s wait window, so a
+    cold-start batch never finished — the 06-22 run fell straight back to opening tabs.
+    A session-detached worker runs the fill to completion, marks Applied, posts its own
+    per-application results, and keeps the browser open for review.
 
-    Verified fills (≥1 field filled) are marked Applied in the pipeline; a job with
-    no fillable form (login-walled Workday/iCIMS) gracefully reports as opened-for-
-    manual — never a hard failure. Returns (verified, opened) lines.
-
-    The fill runs in a daemon thread so the browser can stay OPEN (keep_open) after
-    this returns its summary; we wait up to FILL_WAIT seconds for the fills to land,
-    then report. Disable entirely with the agent field gemini_fill=0."""
-    import threading
-
-    js = _job_sheet()
+    Returns True if the fill was spawned; False ⇒ the caller should just open the tabs
+    (the fill is disabled via gemini_fill=0, or the Playwright filler isn't importable)."""
     if str(fields.get("gemini_fill", "1")).lower() in ("0", "false", "no", "off"):
-        return [], _open_tabs(batch)
-    try:
+        return False
+    try:                                        # confirm the filler exists before spawning a worker
+        import importlib.util
         _agentic_path()
-        from tools.pais_browser import browser_fill_pw_batch  # type: ignore
+        if importlib.util.find_spec("tools.pais_browser") is None:
+            return False
     except Exception:
-        return [], _open_tabs(batch)
-
-    results_box: dict[str, dict] = {}
-    done = threading.Event()
-
-    def _after(results: list[dict]) -> None:
-        for j, r in zip(batch, results):
-            results_box[j.get("url", "")] = r
-        done.set()
-
-    keep = int(os.environ.get("FILL_KEEP_OPEN", "1800"))
-
-    def _runner() -> None:
-        try:
-            browser_fill_pw_batch(batch, keep_open_seconds=keep, after_fill=_after)
-        except Exception:
-            done.set()                          # never leave the caller hanging
-
-    threading.Thread(target=_runner, daemon=True).start()
-    # Wait for the fills to land (the browser keeps running past this in the thread).
-    if not done.wait(timeout=int(os.environ.get("FILL_WAIT", "150"))):
-        return [], _open_tabs(batch)            # filler stalled → fall back to tabs
-
-    verified, opened = [], []
-    for j in batch:
-        company, role, url = j.get("company", "?"), j.get("role", "?"), j.get("url", "")
-        r = results_box.get(url) or {}
-        if r.get("ok"):
-            n = len(r.get("filled", []))
-            verified.append(f"• {company} — {role}\n  {url}  ✓ {n} field(s) filled")
-            if js:
-                try:
-                    js.mark_applied(url)
-                except Exception:
-                    pass
-        else:
-            reason = (r.get("error") or "no fillable form / login-walled")[:55]
-            opened.append(f"• {company} — {role}\n  {url}  ⚠ open in a tab — finish by hand ({reason})")
-    return verified, opened
+        return False
+    try:
+        payload = Path(tempfile.gettempdir()) / f"pais_fill_{os.getpid()}_{int(time.time())}.json"
+        payload.write_text(json.dumps({
+            "batch": batch,
+            "keep_open": int(os.environ.get("FILL_KEEP_OPEN", "1800")),
+        }))
+        worker = Path(__file__).resolve().parent / "fill_worker.py"
+        log = open(Path(tempfile.gettempdir()) / "pais_fill_worker.log", "a")
+        # start_new_session detaches the worker from the routine's process group, so it
+        # survives the routine exit (and the caffeinate wrapper's teardown).
+        subprocess.Popen([sys.executable, str(worker), str(payload)],
+                         stdout=log, stderr=log, start_new_session=True)
+        return True
+    except Exception:
+        return False
 
 
 def _to_apply_rows(js, fallback: list[dict] | None = None) -> list[dict]:
@@ -319,16 +293,22 @@ def run_jobs(secrets: dict, fields: dict, persona: str = "") -> dict:
                       else "Scouted, but found no fresh roles and nothing is queued to apply to."))
         return {"text": head + " Open the Jobs pipeline to review.", "actionable": bool(added)}
 
-    verified, opened = _fill_batch(batch, fields)
-    lines = [f"📋 Jobs run — {added} new role(s) scouted, {len(batch)} application(s) started."]
-    if verified:
-        lines.append(f"\n✅ Gemini is actively filling {len(verified)} (verified by screenshot):")
-        lines += verified
+    if _spawn_fill(batch, fields):
+        lines = [
+            f"📋 Jobs run — {added} new role(s) scouted; started filling {len(batch)} "
+            f"application(s) in the background.",
+            "\nI'll post the result for each one here as it fills, and the browser stays "
+            "open ~30 min for you to review. Nothing is submitted automatically — check the "
+            "form, attach your résumé, and submit yourself. Track status in your Jobs pipeline.",
+        ]
+        return {"text": "\n".join(lines), "actionable": True}
+    # fill disabled (gemini_fill=0) or the filler isn't available → just open the tabs
+    opened = _open_tabs(batch)
+    lines = [f"📋 Jobs run — {added} new role(s) scouted, {len(batch)} application(s) opened."]
     if opened:
         lines.append(f"\n🖥️ Opened {len(opened)} for you to finish by hand:")
         lines += opened
-    lines.append("\n⚠️ Review each form, attach your résumé, and submit yourself — nothing is "
-                 "submitted automatically. Track + edit status in your Jobs pipeline.")
+    lines.append("\n⚠️ Nothing is submitted automatically. Track + edit status in your Jobs pipeline.")
     return {"text": "\n".join(lines), "actionable": True}
 
 
@@ -389,20 +369,19 @@ def run_apply(secrets: dict, fields: dict, persona: str = "") -> str:
     if not batch:
         return ("Nothing queued to apply to — run the Jobs agent to scout fresh roles, "
                 "then I'll open and fill them on your screen.")
-    verified, opened = _fill_batch(batch, fields)
-    lines = []
-    if verified:
-        lines.append(f"✅ Gemini is actively filling {len(verified)} application(s) (verified):")
-        lines += verified
-    if opened:
-        lines.append(f"\n🖥️ Opened {len(opened)} for you to finish by hand:")
-        lines += opened
-    if not lines:
-        return ("Couldn't start any applications — is the Mac awake with Chrome + the "
-                "Gemini panel available? Nothing was submitted.")
-    lines.append("\n⚠️ Review each form, attach your résumé, and submit yourself. Nothing "
-                 "is submitted automatically.")
-    return "\n".join(lines)
+    if _spawn_fill(batch, fields):
+        return (f"📨 Started filling {len(batch)} queued application(s) in the background. "
+                "I'll post the result for each here as it fills, and the browser stays open "
+                "~30 min for you to review. Nothing is submitted automatically — check the "
+                "form, attach your résumé, and submit yourself.")
+    # fill disabled or filler unavailable → just open the tabs
+    opened = _open_tabs(batch)
+    if not opened:
+        return ("Couldn't open any applications. Nothing was submitted — open your Jobs "
+                "pipeline and finish them by hand.")
+    return (f"🖥️ Opened {len(opened)} application(s) for you to finish by hand:\n"
+            + "\n".join(opened)
+            + "\n\n⚠️ Nothing is submitted automatically.")
 
 
 # ── email: read-only Gmail IMAP triage ────────────────────────────────────────
