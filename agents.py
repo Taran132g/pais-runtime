@@ -18,8 +18,10 @@ Requires the `claude` CLI (Claude subscription) on PATH for the real runners.
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -43,16 +45,71 @@ SECRET_NAMES = re.compile(
     r"job_queue\.json|scout_jobs\.json|id_rsa.*|.*\.p12|.*\.pfx)$", re.I)
 
 
-def _claude(prompt: str, tools: str | None = None, timeout: int = 600) -> str:
+def _claude(prompt: str, tools: str | None = None, timeout: int = 600,
+            attempts: int = 2) -> str:
     """Run one `claude -p` completion on the user's subscription. `tools` enables
-    agentic tools (e.g. 'WebSearch,WebFetch') for runners that need the live web."""
+    agentic tools (e.g. 'WebSearch,WebFetch') for runners that need the live web.
+
+    Hardened for the morning routine, which fires in the fragile minutes right
+    after a battery-sleep wake (the 06-22 failure: briefing hung 600s, outreach
+    died with a bare 'claude failed'):
+    - retries transient failures (a cold bg-daemon / network reassociation) with
+      backoff, so one post-wake blip doesn't lose an agent for the day;
+    - launches in its OWN process group and SIGKILLs the whole group on timeout,
+      so a hung `claude` tree can't orphan (the old subprocess.run only reaped the
+      direct child — that's how the stale claude procs accumulated);
+    - surfaces returncode + output on failure instead of a useless 'claude failed'.
+    """
     cmd = ["claude", "-p", prompt]
     if tools:
         cmd += ["--allowedTools", tools, "--dangerously-skip-permissions"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or "claude failed").strip()[:300])
-    return (proc.stdout or "").strip()
+    last, delay = "claude failed", 10
+    for i in range(max(1, attempts)):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            proc.communicate()                       # reap the killed group
+            last = f"timed out after {timeout}s"
+        else:
+            if proc.returncode == 0:
+                return (out or "").strip()
+            detail = (err or "").strip() or (out or "").strip()[:300] or "claude failed"
+            last = f"rc={proc.returncode}: {detail[:300]}"
+        if i + 1 < attempts:                         # transient — back off and retry
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+    raise RuntimeError(last)
+
+
+def warm_up_claude(attempts: int = 4) -> bool:
+    """Fire a tiny throwaway `claude -p` to re-warm the CLI/background daemon BEFORE
+    the real agents run. The first call after a battery wake is the one that hangs
+    (cold bg-daemon + network reassociation) — spend a cheap probe on it instead of
+    burning a real agent's whole timeout. Returns True once a probe returns rc=0."""
+    delay = 5
+    for _ in range(max(1, attempts)):
+        proc = subprocess.Popen(["claude", "-p", "Reply with exactly: ok"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        try:
+            proc.communicate(timeout=120)
+            if proc.returncode == 0:
+                return True
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            proc.communicate()
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+    return False
 
 
 def _settings_block(persona: str, fields: dict) -> str:
@@ -571,10 +628,31 @@ def run_outreach(secrets: dict, fields: dict, persona: str = "") -> dict:
     return {"actionable": saved > 0, "text": out}
 
 
+def _parse_people(raw: str) -> list[dict]:
+    """Pull the first JSON array of {name,...} objects out of a claude reply,
+    tolerating ```fences``` and prose around it (mirrors linkedin_pais.py)."""
+    cleaned = re.sub(r"```(?:json)?", "", raw or "")
+    dec = json.JSONDecoder()
+    for i, ch in enumerate(cleaned):
+        if ch == "[":
+            try:
+                val, _ = dec.raw_decode(cleaned[i:])
+            except Exception:
+                continue
+            if isinstance(val, list) and val and isinstance(val[0], dict) and "name" in val[0]:
+                return val
+    return []
+
+
 # ── linkedin: one connect draft per run ───────────────────────────────────────
 def run_linkedin(secrets: dict, fields: dict, persona: str = "") -> str:
-    """Draft ONE LinkedIn connection note + post-accept follow-up toward the
-    user's networking goal. The user sends it by hand (no automation — ToS)."""
+    """Draft ONE LinkedIn connection note + post-accept follow-up toward the user's
+    networking goal, AND add it as a row to the vault LinkedIn Pipeline so it shows
+    up in the Control Room tracker. The user sends it by hand (no automation — ToS).
+
+    Before 06-22 this only posted free text to the feed and never touched the sheet,
+    so the on-demand path (linkedin_pais.py) filled the Pipeline panel but the daily
+    scheduled run left it empty. Now both paths feed the same source of truth."""
     targets = fields.get("targets") or ""
     goal = fields.get("goal") or "growing their professional network"
     if not targets:
@@ -584,16 +662,42 @@ def run_linkedin(secrets: dict, fields: dict, persona: str = "") -> str:
         f"You are helping the user network on LinkedIn toward this goal: {goal}.\n"
         f"Their targets: {targets}\n"
         f"{_settings_block(persona, fields)}\n"
-        f"Pick the single best target to contact TODAY (say who and why). Produce:\n"
-        f"1) CONNECT — a connection-request note UNDER 200 characters, warm and specific; "
-        f"NEVER ask for a job/referral — the only goal is the Accept.\n"
-        f"2) FOLLOWUP — a 3-4 line message for AFTER they accept: conversational, "
-        f"curiosity-first, asking for a 15-minute chat. No hard ask.\n\n"
-        f"Output:\nTARGET: <who + why today>\nCONNECT: <note>\nFOLLOWUP: <message>\n\n"
-        f"Then one line on what to say if they reply. You send these by hand — I never "
-        f"automate LinkedIn itself."
+        f"Pick the single best target to contact TODAY. Produce a connection-request "
+        f"note UNDER 200 characters (warm and specific; NEVER ask for a job/referral — "
+        f"the only goal is the Accept) and a 3-4 line post-accept follow-up "
+        f"(conversational, curiosity-first, asking for a 15-minute chat, no hard ask).\n"
+        f"Output ONLY a JSON array with ONE object, no prose, no markdown:\n"
+        f'[{{"name":"","role":"","company":"","why":"<who + why today>",'
+        f'"connect":"<note under 200 chars>","followup":"<message>"}}]'
     )
-    return _claude(prompt, timeout=240)
+    raw = _claude(prompt, timeout=240)
+    people = _parse_people(raw)
+    if not people:
+        return raw                                    # parse failed — keep the draft, lose nothing
+
+    added = None
+    try:                                              # mirror into the vault Pipeline (source of truth)
+        _shared = str(Path.home() / "agentic_os")
+        if _shared not in sys.path:
+            sys.path.insert(0, _shared)
+        from tools import linkedin_sheet              # type: ignore
+        added = linkedin_sheet.append_people(people)
+    except Exception:
+        added = None                                  # sheet unavailable — still return the draft
+
+    blocks = []
+    for p in people:
+        blocks.append(
+            f"TARGET: {p.get('name','?')} — {p.get('role','')} @ {p.get('company','')}\n"
+            f"WHY: {p.get('why','')}\n"
+            f"CONNECT: {p.get('connect','')}\n"
+            f"FOLLOWUP: {p.get('followup','')}")
+    body = "\n\n".join(blocks)
+    if added and added > 0:
+        body += f"\n\nAdded {added} to your LinkedIn Pipeline — review and send from the Control Room."
+    elif added == 0:
+        body += "\n\nAlready in your LinkedIn Pipeline — no new row added."
+    return body
 
 
 # ── code: guarded git sync of the user's listed repos ─────────────────────────
@@ -681,9 +785,15 @@ def run_briefing(secrets: dict, fields: dict, persona: str = "", client=None) ->
     feed = ""
     if client is not None:
         try:
-            msgs = client.messages().get("messages", [])[-30:]
-            cutoff = (datetime.now().timestamp() - 86400) * 1000
-            recent = [m for m in msgs if m.get("ts", 0) >= cutoff and m.get("agent") != "briefing"]
+            msgs = client.messages().get("messages", [])
+            # Window = everything SINCE THE LAST BRIEF, not a rigid 24h. A late run
+            # (e.g. 06-22 fired at 08:22 after a battery wake) pushed yesterday's work
+            # just outside a fixed 24h cutoff and the brief went blank. Anchoring to
+            # the previous briefing means a late start still quotes the real activity.
+            prior_briefs = [m.get("ts", 0) for m in msgs if m.get("agent") == "briefing"]
+            cutoff = max(prior_briefs) if prior_briefs else (datetime.now().timestamp() - 86400) * 1000
+            recent = [m for m in msgs[-60:]
+                      if m.get("ts", 0) > cutoff and m.get("agent") != "briefing"]
             feed = "\n\n".join(f"[{m['agent']}] {m['text'][:600]}" for m in recent)[:6000]
         except Exception:
             feed = ""
@@ -697,14 +807,10 @@ def run_briefing(secrets: dict, fields: dict, persona: str = "", client=None) ->
         f"what's open, what matters next — with the exact next action for each thread."
     )
     # briefing is the FIRST agent every run, so it absorbs any cold-start latency
-    # (the first `claude -p` after a wake). Give it headroom + one retry instead of
-    # losing the whole brief to a slow first call. NOTE: this does NOT rescue a run
-    # where the Mac is asleep on battery (the timer is wall-clock and keeps ticking
-    # while frozen) — that's an AC/lid problem, not a timeout problem.
-    try:
-        return _claude(prompt, timeout=420)
-    except subprocess.TimeoutExpired:
-        return _claude(prompt, timeout=600)
+    # (the first `claude -p` after a wake). _claude already retries with backoff and
+    # kills a hung process group, and the routine warms the CLI before any agent runs
+    # — so give the brief headroom and let those guards handle a slow first call.
+    return _claude(prompt, timeout=480)
 
 
 def run_assistant(secrets: dict, fields: dict, persona: str = "") -> str:

@@ -341,6 +341,12 @@ def cmd_routine(scheduled: bool = False):
         print(f"  ⤷ skipping {', '.join(skipped)}: no local runner (configured backend-side only)")
     run_order = [a for a in order if a != "reviewer" and a in runners.RUNNERS]
     print(f"▶ Morning routine: {' → '.join(run_order)} → reviewer")
+    # Warm the `claude` CLI BEFORE any real agent. The routine fires in the fragile
+    # minutes right after a battery-sleep wake; the first `claude -p` then is the one
+    # that hangs or dies cold (the 06-22 failure took out briefing + outreach). Spend
+    # a cheap throwaway probe on that cold start so the real agents hit a warm daemon.
+    if not runners.warm_up_claude():
+        print("  ⚠ claude CLI did not warm up after several tries — running anyway", file=sys.stderr)
     # Scheduled runs are reviewer-only on Telegram, but these agents produce a
     # ready-to-act deliverable (e.g. Gmail drafts) that's worthless if it only
     # lands on the web feed — so they always reach the phone when actionable.
