@@ -697,7 +697,7 @@ def run_code(secrets: dict, fields: dict, persona: str = "") -> str:
     if not repos:
         return ("My 'Repos to sync' setting looks like a description, not paths — I "
                 "can't sync prose. Set it to comma-separated local repo paths, e.g.\n"
-                "  ~/agentic_os, ~/pais-runtime, ~/FindingFounders\n"
+                "  ~/agentic_os, ~/pais-runtime, ~/Automated-Trading-Bot\n"
                 "and I'll commit + push each behind the secret guard.")
     report = []
     if malformed:
@@ -792,6 +792,34 @@ def run_briefing(secrets: dict, fields: dict, persona: str = "", client=None) ->
     return _claude(prompt, timeout=480)
 
 
+# ── sales: local-business prospecting into the call sheet ─────────────────────
+def run_sales(secrets: dict, fields: dict, persona: str = "") -> dict:
+    """Sales prospecting — runs the SAME script the on-demand Sales button runs
+    (~/agentic_os/sales_agent.py): researches local businesses in the Royersford↔KOP
+    corridor via claude, dedupes against the call sheet, and appends new leads as
+    '🟣 To call' to the vault Piontrix Sales Pipeline. Returns its summary for the
+    feed. Reusing the one script keeps scheduled + on-demand identical."""
+    script = Path.home() / "agentic_os" / "sales_agent.py"
+    if not script.exists():
+        return {"actionable": False,
+                "text": "Sales agent script not found (~/agentic_os/sales_agent.py)."}
+    env = {**os.environ, "ANTHROPIC_MODEL": "claude-sonnet-4-6"}   # cost pin (same as bridge)
+    if (persona or "").strip():
+        env["PAIS_PERSONA"] = persona
+    if fields:
+        env["PAIS_FIELDS"] = json.dumps(fields, ensure_ascii=False)
+    try:
+        proc = subprocess.run([sys.executable, str(script)], cwd=str(script.parent),
+                              capture_output=True, text=True, timeout=540, env=env)
+    except subprocess.TimeoutExpired:
+        return {"actionable": False, "text": "Sales agent timed out after 540s."}
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()[:300] or (proc.stdout or "").strip()[:300] or "sales_agent failed"
+        return {"actionable": False, "text": f"Sales agent failed: {err}"}
+    out = (proc.stdout or "").strip()
+    return {"text": out or "Sales agent ran — no new prospects today.", "actionable": bool(out)}
+
+
 def run_assistant(secrets: dict, fields: dict, persona: str = "") -> str:
     return ("Control Room online. Chat with me on the website — your other agents run "
             "here on your machine and post their work to this feed.")
@@ -806,6 +834,7 @@ RUNNERS = {
     "email":     run_email,       # read-only Gmail IMAP triage
     "outreach":  run_outreach,    # prospect + draft for review (never sends)
     "linkedin":  run_linkedin,    # 1 connect draft per run (sent by hand)
+    "sales":     run_sales,       # local-business prospecting → call sheet
     "code":      run_code,        # guarded git sync
     "assistant": run_assistant,
 }
