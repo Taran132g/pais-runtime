@@ -369,15 +369,42 @@ def cmd_routine(scheduled: bool = False):
             print(f"  ✗ {aid}: {e}", file=sys.stderr)
             if not scheduled:                      # on schedule the reviewer flags failures
                 _telegram(f"⚠️ {aid} failed in the morning routine: {str(e)[:300]}")
-    try:
-        c.run_backend_agent("reviewer")            # audits the run via the backend
-        print("  ✓ reviewer: audited the run")
-        try:                                       # mirror the reviewer's FULL report to Telegram
-            rev = c.messages(agent="reviewer").get("messages", [])
-            if rev:
-                _tg_agent_full("reviewer", rev[-1].get("text", ""))
+    def _latest_rev_ts() -> float:
+        """Timestamp of the newest reviewer audit, 0.0 if none — used to tell a
+        FRESH audit from a stale one so we never re-send yesterday's report."""
+        try:
+            msgs = c.messages(agent="reviewer").get("messages", [])
+            if not msgs:
+                return 0.0
+            return float(msgs[-1].get("created_at") or msgs[-1].get("ts") or 0)
         except Exception:
-            pass
+            return 0.0
+
+    try:
+        before_ts = _latest_rev_ts()               # snapshot BEFORE the audit runs
+        res = c.run_backend_agent("reviewer")      # audits the run via the backend
+        # HTTP 200 with ran=False = backend reached the reviewer but it produced
+        # no audit (e.g. the bridge/claude was session-limited). Don't claim
+        # success, and DON'T mirror a stale report as if it were today's.
+        if isinstance(res, dict) and res.get("ran") is False:
+            why = str(res.get("message") or "no audit produced")[:200]
+            print(f"  ⚠ reviewer: ran but produced no audit — {why}", file=sys.stderr)
+            _telegram(f"⚠️ Reviewer produced no audit this run — {why}. "
+                      f"Not re-sending an older report.")
+        else:
+            print("  ✓ reviewer: audited the run")
+            try:                                   # mirror ONLY a genuinely fresh report
+                rev = c.messages(agent="reviewer").get("messages", [])
+                newest = rev[-1] if rev else None
+                newest_ts = (float(newest.get("created_at") or newest.get("ts") or 0)
+                             if newest else 0.0)
+                if newest and newest_ts > before_ts:
+                    _tg_agent_full("reviewer", newest.get("text", ""))
+                else:
+                    print("  ⚠ reviewer: no NEW audit in feed — skipping stale mirror",
+                          file=sys.stderr)
+            except Exception:
+                pass
     except Exception as e:
         print(f"  ✗ reviewer: {e}", file=sys.stderr)
     print(f"Routine done — {ok}/{len(run_order)} posted, then audited.")

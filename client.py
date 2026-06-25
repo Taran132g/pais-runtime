@@ -134,14 +134,25 @@ class PaisClient:
         """The team's feed messages (newest last) — used by the briefing runner."""
         return self._get("/api/agents/messages" + (f"?agent={agent}" if agent else ""))
 
-    def run_backend_agent(self, agent: str) -> None:
+    def run_backend_agent(self, agent: str) -> dict:
         """Trigger a backend-run agent (e.g. the reviewer audit, which reads the
-        web feed). Used at the end of the routine."""
-        requests.post(
+        web feed). Used at the end of the routine.
+
+        Returns the backend's result dict — typically {"ran": bool, ...}. A 200
+        with ran=False means the agent was REACHED but produced no output (e.g.
+        the bridge/claude was session-limited and posted no audit). Callers MUST
+        check `ran`, not just that this didn't raise — a healthy HTTP 200 is not
+        proof the audit was written."""
+        r = requests.post(
             f"{API_BASE}/api/agents/run/{agent}",
             headers={"Authorization": "Bearer " + self._access_token()},
             timeout=180,
         )
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            return {"ran": True}        # legacy/empty body — assume it ran
 
     def post_message(self, agent: str, text: str) -> None:
         """Post an agent's update to the user's website feed (replaces Telegram)."""
