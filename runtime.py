@@ -266,9 +266,12 @@ def cmd_run(agent: str):
     import agents as runners
     c = PaisClient()
     sec = c.secrets().get("connections", {})
-    acfg = c.config().get("agents", {}).get(agent, {}) or {}
+    cfg = c.config()
+    acfg = cfg.get("agents", {}).get(agent, {}) or {}
+    model = acfg.get("model") or cfg.get("routine", {}).get("model")
     text, actionable = runners.run_agent(agent, sec, acfg.get("fields", {}),
-                                         persona=acfg.get("persona", ""), client=c)
+                                         persona=acfg.get("persona", ""), client=c,
+                                         model=model)
     c.post_message(agent, text)
     _tg_agent_full(agent, text)                    # → Telegram, FULL output (manual run)
     note = "" if actionable else " (ran, but no actionable output — check its settings)"
@@ -351,12 +354,18 @@ def cmd_routine(scheduled: bool = False):
     # ready-to-act deliverable (e.g. Gmail drafts) that's worthless if it only
     # lands on the web feed — so they always reach the phone when actionable.
     ALWAYS_TG = {"outreach"}
+    # Model: per-agent override → routine-level → runner's Sonnet fallback. Today
+    # the web config carries neither, so every agent resolves to Sonnet (off the
+    # heavy Opus CLI default). When the site exposes a model field, it flows here.
+    routine_model = cfg.get("routine", {}).get("model")
     ok = 0
     for aid in run_order:
         acfg = agents_cfg.get(aid, {}) or {}
+        model = acfg.get("model") or routine_model
         try:
             text, actionable = runners.run_agent(aid, sec, acfg.get("fields", {}),
-                                                  persona=acfg.get("persona", ""), client=c)
+                                                  persona=acfg.get("persona", ""), client=c,
+                                                  model=model)
             c.post_message(aid, text)              # → website feed (always)
             if not scheduled:                      # scheduled = reviewer-only Telegram …
                 _tg_agent(aid, text)

@@ -45,6 +45,26 @@ SECRET_NAMES = re.compile(
     r"brainscan_creators\.json|linkedin_targets\.json|applications\.json|"
     r"job_queue\.json|scout_jobs\.json|id_rsa.*|.*\.p12|.*\.pfx)$", re.I)
 
+# ── model selection ───────────────────────────────────────────────────────────
+# Agents run on the user's Claude subscription via `claude -p`. The CLI default
+# (from ~/.claude/settings.json) is Opus, the heaviest model — running 6+ agentic
+# completions on it every morning burns the 5-hour usage window fast. So the model
+# is resolved per-run from the web config (agent-level → routine-level), falling
+# back to Sonnet. run_agent sets _ACTIVE_MODEL before each runner; _claude (and the
+# sales corridor) inject it into the `claude` subprocess env. When the site/backend
+# expose a `model` field, the chosen value flows here with no further change.
+DEFAULT_MODEL = "claude-sonnet-4-6"
+_ACTIVE_MODEL: str | None = None
+
+
+def _claude_env() -> dict:
+    """Subprocess env with ANTHROPIC_MODEL set to the active (configured) model,
+    so `claude -p` doesn't fall through to the heavier CLI default."""
+    env = os.environ.copy()
+    model = _ACTIVE_MODEL or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
+    env["ANTHROPIC_MODEL"] = model
+    return env
+
 
 def _claude(prompt: str, tools: str | None = None, timeout: int = 600,
             attempts: int = 2) -> str:
@@ -65,9 +85,10 @@ def _claude(prompt: str, tools: str | None = None, timeout: int = 600,
     if tools:
         cmd += ["--allowedTools", tools, "--dangerously-skip-permissions"]
     last, delay = "claude failed", 10
+    env = _claude_env()
     for i in range(max(1, attempts)):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True)
+                                text=True, start_new_session=True, env=env)
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -97,7 +118,7 @@ def warm_up_claude(attempts: int = 4) -> bool:
     for _ in range(max(1, attempts)):
         proc = subprocess.Popen(["claude", "-p", "Reply with exactly: ok"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True)
+                                text=True, start_new_session=True, env=_claude_env())
         try:
             proc.communicate(timeout=120)
             if proc.returncode == 0:
@@ -809,7 +830,7 @@ def run_sales(secrets: dict, fields: dict, persona: str = "") -> dict:
     if not script.exists():
         return {"actionable": False,
                 "text": "Sales agent script not found (~/agentic_os/sales_agent.py)."}
-    env = {**os.environ, "ANTHROPIC_MODEL": "claude-sonnet-4-6"}   # cost pin (same as bridge)
+    env = _claude_env()            # honors the configured model (Sonnet fallback)
     if (persona or "").strip():
         env["PAIS_PERSONA"] = persona
     if fields:
@@ -850,17 +871,25 @@ RUNNERS = {
 
 
 def run_agent(agent: str, secrets: dict, fields: dict, persona: str = "",
-              client=None) -> tuple[str, bool]:
+              client=None, model: str | None = None) -> tuple[str, bool]:
     """Run a teammate and return (text_for_feed, actionable). A runner may return a
     plain string (always treated as actionable) or a dict {text, actionable} so it
-    can signal that it ran but produced nothing the user can act on yet."""
+    can signal that it ran but produced nothing the user can act on yet.
+
+    `model` is the configured model for this agent (web config → Sonnet fallback);
+    it's published to the module so every `claude -p` this runner spawns uses it."""
+    global _ACTIVE_MODEL
     runner = RUNNERS.get(agent)
     if not runner:
         raise RuntimeError(f"No runner for agent '{agent}'.")
-    if runner is run_briefing:
-        result = runner(secrets, fields, persona, client=client)
-    else:
-        result = runner(secrets, fields, persona)
+    _ACTIVE_MODEL = model or DEFAULT_MODEL
+    try:
+        if runner is run_briefing:
+            result = runner(secrets, fields, persona, client=client)
+        else:
+            result = runner(secrets, fields, persona)
+    finally:
+        _ACTIVE_MODEL = None
     if isinstance(result, dict):
         return result.get("text", ""), bool(result.get("actionable", True))
     return result, True
