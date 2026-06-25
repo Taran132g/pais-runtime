@@ -780,8 +780,14 @@ def run_briefing(secrets: dict, fields: dict, persona: str = "", client=None) ->
     prompt = (
         f"Write the user's daily brief for {today}.\n"
         f"{_settings_block(persona, fields)}\n"
-        f"WHAT THEIR AGENT TEAM DID IN THE LAST DAY (their real feed — quote from it, "
-        f"never invent):\n{feed or '(no agent activity in the last day)'}\n\n"
+        f"WHAT THEIR AGENT TEAM DID IN THE LAST RUN (their real feed — quote from it, "
+        f"never invent):\n{feed or '(no agent activity in the last run)'}\n\n"
+        f"TIMING — IMPORTANT: you run FIRST each morning, before today's agents "
+        f"(jobs, outreach, etc.) execute. The feed above is the PREVIOUS run's "
+        f"completed work, not a live snapshot of today. Frame it as 'what your team "
+        f"finished last run / overnight'. Do NOT present pipeline counts (e.g. "
+        f"'N applications filled') as today's live state — today's numbers will be "
+        f"set by the agents that run after this brief.\n"
         f"{DESCRIPTIVE}\nLead with the single most important item, then: what happened, "
         f"what's open, what matters next — with the exact next action for each thread."
     )
@@ -814,7 +820,10 @@ def run_sales(secrets: dict, fields: dict, persona: str = "") -> dict:
     except subprocess.TimeoutExpired:
         return {"actionable": False, "text": "Sales agent timed out after 540s."}
     if proc.returncode != 0:
-        err = (proc.stderr or "").strip()[:300] or (proc.stdout or "").strip()[:300] or "sales_agent failed"
+        # Keep the TAIL, not the head: a Python traceback puts the actual
+        # exception type+message at the END, so [:300] threw away the one line
+        # that explained the failure (and masked the 06-25 iCloud-eviction crash).
+        err = (proc.stderr or "").strip()[-600:] or (proc.stdout or "").strip()[-600:] or "sales_agent failed"
         return {"actionable": False, "text": f"Sales agent failed: {err}"}
     out = (proc.stdout or "").strip()
     return {"text": out or "Sales agent ran — no new prospects today.", "actionable": bool(out)}
