@@ -281,9 +281,17 @@ def _to_apply_rows(js, fallback: list[dict] | None = None) -> list[dict]:
 
 # ── jobs: the merged scout + apply agent ──────────────────────────────────────
 def run_jobs(secrets: dict, fields: dict, persona: str = "") -> dict:
-    """One agent: scout fresh roles → append to the vault Job Pipeline → drive the
-    Gemini fill on the oldest 'To apply' rows (open-tab fallback) → mark verified
-    fills Applied. Replaces the old split career + apply agents."""
+    """SCOUT-ONLY: scout fresh roles → append them to the vault Job Pipeline → stop.
+
+    The fill is no longer auto-driven here. It moved to an on-demand, per-job
+    action: the Control Room shows a 'Fill' button on each '🔍 To apply' row, and
+    pressing it runs the fill for just that job (bridge /job-fill → fill_worker on
+    the Mac). This removes the old failure mode where the morning routine filled
+    forms into a browser that auto-closed ~30 min later — usually before the user
+    sat down — so it always looked like nothing happened. Now scouting happens on
+    schedule and the user fires each fill when actually at the screen. The fill
+    machinery (_spawn_fill / run_apply / _to_apply_rows) is unchanged and is what
+    the on-demand path (_fill_one_url, via the bridge) reuses."""
     js = _job_sheet()
     scouted = []
     try:
@@ -306,31 +314,42 @@ def run_jobs(secrets: dict, fields: dict, persona: str = "") -> dict:
     except Exception:
         pass
 
-    cap = int(os.environ.get("APPLY_FILL_LIMIT", "5"))
-    batch = _to_apply_rows(js, fallback=scouted)[:cap]
-    if not batch:
-        head = (f"Scouted — added {added} new role(s) to your Job Pipeline." if added
-                else (f"Scouted, but found no fresh roles today ({scout_err})." if scout_err
-                      else "Scouted, but found no fresh roles and nothing is queued to apply to."))
-        return {"text": head + " Open the Jobs pipeline to review.", "actionable": bool(added)}
+    queued = len(_to_apply_rows(js, fallback=scouted))
+    if added:
+        head = f"📋 Jobs scout — added {added} new role(s) to your Job Pipeline."
+    elif scout_err:
+        head = f"📋 Jobs scout — no fresh roles today ({scout_err})."
+    else:
+        head = "📋 Jobs scout — ran, but found no fresh roles to add."
+    tail = (f"\n\n{queued} role(s) sit in '🔍 To apply'. Open your Jobs pipeline and press "
+            "Fill on any you want — the form opens filled on your screen to review, attach "
+            "your résumé, and submit. Nothing is filled or sent automatically."
+            if queued else "\n\nOpen your Jobs pipeline to review.")
+    return {"text": head + tail, "actionable": bool(added)}
 
-    if _spawn_fill(batch, fields):
-        lines = [
-            f"📋 Jobs run — {added} new role(s) scouted; started filling {len(batch)} "
-            f"application(s) in the background.",
-            "\nI'll post the result for each one here as it fills, and the browser stays "
-            "open ~30 min for you to review. Nothing is submitted automatically — check the "
-            "form, attach your résumé, and submit yourself. Track status in your Jobs pipeline.",
-        ]
-        return {"text": "\n".join(lines), "actionable": True}
-    # fill disabled (gemini_fill=0) or the filler isn't available → just open the tabs
-    opened = _open_tabs(batch)
-    lines = [f"📋 Jobs run — {added} new role(s) scouted, {len(batch)} application(s) opened."]
-    if opened:
-        lines.append(f"\n🖥️ Opened {len(opened)} for you to finish by hand:")
-        lines += opened
-    lines.append("\n⚠️ Nothing is submitted automatically. Track + edit status in your Jobs pipeline.")
-    return {"text": "\n".join(lines), "actionable": True}
+
+def _fill_one_url(url: str, fields: dict | None = None) -> dict:
+    """On-demand single-job fill, triggered by the Control Room 'Fill' button via
+    the Mac bridge. Looks the row up in the vault pipeline by URL, builds a 1-job
+    batch, and spawns the SAME detached fill worker the routine used to. Returns
+    {"ok": bool, "error"?: str, "company"?, "role"?}."""
+    js = _job_sheet()
+    if js is None:
+        return {"ok": False, "error": "job sheet unavailable"}
+    url = (url or "").strip()
+    if not url.startswith("http"):
+        return {"ok": False, "error": "valid job url required"}
+    try:
+        match = next((r for r in js.rows() if r.get("url") == url), None)
+    except Exception as e:
+        return {"ok": False, "error": f"pipeline read failed: {str(e)[:80]}"}
+    if not match:
+        return {"ok": False, "error": "job not found in pipeline"}
+    batch = [{"company": match.get("company", "?"),
+              "role": match.get("role", ""), "url": url}]
+    if _spawn_fill(batch, fields or {}):
+        return {"ok": True, "company": match.get("company", "?"), "role": match.get("role", "")}
+    return {"ok": False, "error": "fill worker could not start (filler unavailable?)"}
 
 
 def _verify_fill_screenshot(res: dict, company: str, role: str) -> tuple[bool, str]:
@@ -469,18 +488,26 @@ _EMAIL_JUNK = ("example.com", "sentry.io", "wixpress.com", "domain.com", "email.
 
 def _parse_prospects(text: str) -> list[dict]:
     """Pull structured prospects out of the claude draft block. Tolerant of the
-    preamble/sources claude adds around the PROSPECT/SUBJECT/body format."""
+    preamble/sources claude adds, AND of markdown the model sometimes wraps the
+    labels in — e.g. `**PROSPECT: Name | domain**` / `**SUBJECT:** line`. The
+    label match now allows leading bullets/bold (`*`, `-`, whitespace) and we
+    strip stray `*` off the captured name/domain/subject so a formatting drift
+    never silently yields zero prospects (the 06-26 'nothing to save' bug)."""
     out = []
-    for block in re.split(r"(?m)^PROSPECT:\s*", text)[1:]:
+    _clean = lambda s: s.strip().strip("*").strip()
+    # split on a PROSPECT label at line start, ignoring leading markdown/bullets
+    for block in re.split(r"(?mi)^[*\-\s]*PROSPECT:\s*", text)[1:]:
         head = (block.splitlines() or [""])[0]
         name, _, dom_part = head.partition("|")
         md = re.search(r"([\w.-]+\.\w{2,})", dom_part)
-        ms = re.search(r"(?m)^SUBJECT:\s*(.+)$", block)
-        if not (name.strip() and ms):
+        ms = re.search(r"(?mi)^[*\-\s]*SUBJECT:\**\s*(.+)$", block)
+        if not (_clean(name) and ms):
             continue
-        body = re.split(r"(?m)^\s*-{3,}\s*$|^Sources:", block[ms.end():])[0].strip()
-        out.append({"name": name.strip(), "domain": (md.group(1) if md else "").lower(),
-                    "subject": ms.group(1).strip(), "body": body})
+        body = re.split(r"(?m)^\s*\**-{3,}\**\s*$|^\**Sources:", block[ms.end():])[0]
+        out.append({"name": _clean(name),
+                    "domain": _clean(md.group(1) if md else "").lower(),
+                    "subject": _clean(ms.group(1)),
+                    "body": body.strip()})
     return out
 
 
@@ -539,6 +566,79 @@ def _create_gmail_draft(addr: str, pw: str, to: str, subject: str, body: str) ->
             M.logout()
         except Exception:
             pass
+
+
+def _draft_for_business(business: str, vertical: str, secrets: dict) -> dict:
+    """Draft + save ONE Gmail outreach draft for a specific local business (used by
+    the Sales pipeline's ✉ Draft button). Finds the business's site + a contact
+    email via a single web-search claude pass, reproduces the shared pitch template
+    (tailoring only the 'money leaks' clause to the vertical), and saves it to Gmail
+    Drafts — NEVER sends. Returns {ok, email?, business, error?}."""
+    addr = secrets.get("gmail_address", "")
+    pw = secrets.get("gmail_app_password", "")
+    if not (addr and pw):
+        return {"ok": False, "business": business,
+                "error": "Gmail isn't connected — add it in settings to save drafts."}
+    try:
+        _shared = str(Path.home() / "agentic_os")
+        if _shared not in sys.path:
+            sys.path.insert(0, _shared)
+        from outreach_pitch import PITCH_TEMPLATE, with_signature
+    except Exception as e:
+        return {"ok": False, "business": business, "error": f"pitch module missing ({e})"}
+    hunter = secrets.get("hunter_api_key", "")
+    prompt = (
+        f"Find the official website domain and a public contact email for '{business}', "
+        f"a {vertical or 'local'} business in the Collegeville / Phoenixville / King of "
+        f"Prussia, PA area. Then write a cold-outreach email by reproducing this template "
+        f"EXACTLY, word for word, tailoring ONLY the 'money leaks like …' clause so the two "
+        f"examples fit a {vertical or 'local business'} (one short clause, two examples). Do "
+        f"not add, drop, or reorder any other sentence. Also write a SHORT lowercase subject "
+        f"(e.g. \"quick idea for {business.lower()}\").\n\nTEMPLATE:\n{PITCH_TEMPLATE}\n\n"
+        f"Output EXACTLY these four labels, nothing else:\n"
+        f"DOMAIN: <domain or none>\nEMAIL: <email or none>\nSUBJECT: <line>\nBODY:\n<body>"
+    )
+    out = _claude(prompt, tools="WebSearch,WebFetch", timeout=300) or ""
+    g = lambda pat: (re.search(pat, out).group(1).strip() if re.search(pat, out) else "")
+    domain = g(r"(?mi)^DOMAIN:\s*(.+)$")
+    email = g(r"(?mi)^EMAIL:\s*(.+)$")
+    subject = g(r"(?mi)^SUBJECT:\s*(.+)$") or f"quick idea for {business}"
+    bm = re.search(r"(?mis)^BODY:\s*(.+)$", out)
+    body_raw = (bm.group(1).strip() if bm else "")
+    if email.lower() in ("none", "n/a", ""):
+        email = ""
+    if not email and domain and domain.lower() not in ("none", "n/a"):
+        email = _resolve_contact(re.sub(r"^https?://", "", domain).strip("/ "), hunter)
+    if not body_raw:
+        return {"ok": False, "business": business, "error": "couldn't draft a body"}
+    body = with_signature(body_raw)
+    try:
+        drafted = _create_gmail_draft(addr, pw, email, subject, body)
+    except Exception as e:
+        return {"ok": False, "business": business, "error": f"draft save failed ({str(e)[:60]})"}
+    if not drafted:
+        return {"ok": False, "business": business, "error": "Gmail rejected the draft"}
+    return {"ok": True, "business": business, "email": email}
+
+
+def _draft_one_business(business: str, vertical: str = "") -> dict:
+    """On-demand: spawn a DETACHED worker that drafts + saves a Gmail draft for one
+    Sales-pipeline business, then posts the result to the feed. Detached because the
+    web-search + draft takes too long to hold an HTTP request open (mirrors the jobs
+    fill worker). Returns {ok, business, error?} for the immediate button response."""
+    business = (business or "").strip()
+    if not business:
+        return {"ok": False, "error": "business name required"}
+    try:
+        payload = Path(tempfile.gettempdir()) / f"pais_draft_{os.getpid()}_{int(time.time())}.json"
+        payload.write_text(json.dumps({"business": business, "vertical": vertical}))
+        worker = Path(__file__).resolve().parent / "draft_worker.py"
+        log = open(Path(tempfile.gettempdir()) / "pais_draft_worker.log", "a")
+        subprocess.Popen([sys.executable, str(worker), str(payload)],
+                         stdout=log, stderr=log, start_new_session=True)
+        return {"ok": True, "business": business}
+    except Exception as e:
+        return {"ok": False, "business": business, "error": str(e)[:120]}
 
 
 # The fixed local-business pitch + signature live in ~/agentic_os/outreach_pitch.py
