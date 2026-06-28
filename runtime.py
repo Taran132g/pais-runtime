@@ -13,9 +13,9 @@ Usage:
     python runtime.py status                            # show your routine + connections
     python runtime.py routine                           # run the whole routine now, in order
     python runtime.py run <agent>                       # run one workflow now
-    python runtime.py daemon                            # run the persistent scheduler loop (installed by `schedule`)
-    python runtime.py schedule                          # install the always-on runtime daemon
-    python runtime.py unschedule                        # remove it
+    python runtime.py daemon                            # [owner-only] run the persistent scheduler loop (installed by `schedule`)
+    python runtime.py schedule                          # [owner-only] install the always-on runtime daemon
+    python runtime.py unschedule                        # remove the scheduler daemon
 
 The routine runs your stacked workflows sequentially (the local mirror of
 morning_stack.sh): each is guarded so one failure never stops the chain.
@@ -432,6 +432,16 @@ def cmd_daemon():
     this loop). On macOS the loop is frozen while the Mac sleeps and resumes on
     wake — so a routine missed at 7:30 fires the moment the machine is next awake.
     """
+    # Scheduling is owner-only. Fail OPEN on any error so a transient outage
+    # can't silently kill the owner's morning routine — only an explicit
+    # owner=False from the backend stops the daemon.
+    try:
+        owner = PaisClient().config().get("owner", True)
+    except Exception:
+        owner = True
+    if owner is False:
+        print("[daemon] scheduled runs are owner-only — exiting.", flush=True)
+        return
     print(f"[daemon] started pid={os.getpid()} — checking every 60s", flush=True)
     _hold_awake(False)                    # clear any stale disablesleep from a prior crash
     cron = "30 7 * * *"
@@ -484,7 +494,12 @@ def cmd_schedule():
     daemon's internal loop instead catches up on the next wake.
     """
     c = PaisClient()
-    rt = c.config().get("routine", {})
+    cfg = c.config()
+    if cfg.get("owner") is False:
+        print("Scheduled runs aren't available on this account.\n"
+              "You can still run your agents anytime with:  python runtime.py routine")
+        return
+    rt = cfg.get("routine", {})
     order = [a for a in rt.get("order", []) if a]
     if not order:
         print("Your morning routine is empty — stack workflows at /app first.")
